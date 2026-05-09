@@ -1,0 +1,46 @@
+#!/usr/bin/bash
+# build — compile firmware variants and collect .uf2 images into kits/
+#
+# Usage:
+#   ./build           build picow only
+#   ./build all       build all 6 variants (2 boards × 3 display configs)
+#   ./build pico      build picow only
+#   ./build pico2     build pico2w only
+#
+# Set PICO_SDK_PATH if the SDK is not at ~/workspace/pico-sdk.
+
+SDK="${PICO_SDK_PATH:-$HOME/workspace/pico-sdk}"
+JOBS="$(nproc)"
+NETMON_VERSION="$(cat "$(dirname "$0")/VERSION" | tr -d '[:space:]')"
+
+case "${1:-pico}" in
+    all)   BOARDS="picow pico2w" ;;
+    pico)  BOARDS="picow" ;;
+    pico2) BOARDS="pico2w" ;;
+    *)     echo "Usage: $0 [all|pico|pico2]" >&2; exit 1 ;;
+esac
+
+mkdir -p kits
+
+build_variant() {
+    local board="$1" disp="$2" flags="$3"
+    local dir="build_${board}_${disp}"
+    echo "--- ${board} / ${disp} ---"
+    cmake -B "$dir" -DPICO_SDK_PATH="$SDK" -DPICO_BOARD="$board" $flags || return 1
+    make -j"$JOBS" -C "$dir"                                            || return 1
+    local uf2
+    uf2=$(ls "$dir"/picoOS/src/*.uf2 2>/dev/null | head -1)
+    [ -z "$uf2" ] && echo "ERROR: no .uf2 found in $dir/picoOS/src/" >&2 && return 1
+    cp -f "$uf2" "kits/netmon-${NETMON_VERSION}.uf2"
+}
+
+for board in $BOARDS; do
+    #build_variant "$board" ND  "-DPICOOS_DISPLAY_ENABLE=OFF"
+    #build_variant "$board" D   "-DPICOOS_DISPLAY_ENABLE=ON  -DPICOOS_DISPLAY_PACK2=OFF"
+    build_variant "$board" D2  "-DPICOOS_DISPLAY_ENABLE=ON  -DPICOOS_DISPLAY_PACK2=ON"
+done
+
+echo ""
+echo "Done. netmon v${NETMON_VERSION} — kits/ contents:"
+ls -1 kits/*.uf2
+

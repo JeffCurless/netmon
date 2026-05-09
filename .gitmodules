@@ -1,0 +1,3 @@
+[submodule "picoOS"]
+	path = picoOS
+	url = git@github.com:JeffCurless/picoOS.git
