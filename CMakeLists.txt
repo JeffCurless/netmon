@@ -41,10 +41,18 @@ else()
     set(PICOOS_APP_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/app_table.c
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/myapp.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/apps/netmon.c
     )
     set(PICOOS_APP_INCLUDE_DIRS
         ${CMAKE_CURRENT_SOURCE_DIR}/apps
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# NetMon version — read from VERSION file at the repo root.
+# ---------------------------------------------------------------------------
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" NETMON_VERSION)
+string(STRIP "${NETMON_VERSION}" NETMON_VERSION)
+add_compile_definitions(NETMON_VERSION="${NETMON_VERSION}")
 
 add_subdirectory(picoOS/src)
