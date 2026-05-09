@@ -10,9 +10,7 @@
 #include "kernel/mem.h"
 #include "drivers/display.h"
 #include "netmon.h"
-#ifdef PICOOS_WIFI_ENABLE
 #include "kernel/wifi.h"
-#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -40,7 +38,7 @@
 #define GRAPH_H     100u
 #define GRAPH_Y_BOT ((uint16_t)(DISP_HEIGHT - 1u))
 #define GRAPH_Y_TOP ((uint16_t)(DISP_HEIGHT - GRAPH_H))
-#define GRAPH_GAP_W   8u          /* blank columns just ahead of the write head */
+#define GRAPH_GAP_W   8u          /* blank gap starting at the write head — marks current position */
 
 /* ---- layout --------------------------------------------------------------- */
 #define TITLE_H      20u
@@ -70,7 +68,6 @@ typedef struct {
 
 /* ---- WiFi result cache ---------------------------------------------------- */
 
-#ifdef PICOOS_WIFI_ENABLE
 static wifi_scan_result_t s_wifi_cache[WIFI_MAX_SCAN_RESULTS];
 static int                s_wifi_ucount = 0;
 
@@ -82,11 +79,8 @@ static int     s_wifi_chan_count[WIFI_MAX_SCAN_RESULTS];
  * 0 is used as the "no data" sentinel; real RSSI values are always < 0. */
 static int8_t s_rssi_history[DISP_WIDTH];
 static int    s_graph_head = 0;   /* index of next write position */
-#endif
 
 /* ---- WiFi helpers --------------------------------------------------------- */
-
-#ifdef PICOOS_WIFI_ENABLE
 
 /* Map RSSI to a display color per the signal-quality table. */
 static uint8_t rssi_color(int16_t rssi)
@@ -186,8 +180,6 @@ static void merge_into_cache(const wifi_scan_result_t *raw,
         }
     }
 }
-
-#endif /* PICOOS_WIFI_ENABLE */
 
 /* ---- drawing helpers ------------------------------------------------------ */
 
@@ -308,7 +300,6 @@ static void render_wifi(ui_state_t *st)
     draw_title("WiFi Networks");
     clear_content();
 
-#ifdef PICOOS_WIFI_ENABLE
     if (s_wifi_ucount == 0) {
         draw_message(st->scan_pending ? "Scanning..." : "No networks found");
         return;
@@ -322,9 +313,6 @@ static void render_wifi(ui_state_t *st)
         snprintf(line, sizeof(line), "%-11.11s %4d", net->ssid, (int)net->rssi);
         draw_row(view, line, rssi_color(net->rssi), i == st->sel);
     }
-#else
-    draw_message("WiFi not enabled");
-#endif
 }
 
 static void render_bt(void)
@@ -377,6 +365,7 @@ static void render_graph(void)
         int8_t rv = s_rssi_history[x];
         if (rv == 0) continue;
 
+        /* Map RSSI (-100..-30 dBm) → bar height 0..100 %. */
         int str = ((int)rv + 100) * 100 / 70;
         if (str < 1)   str = 1;
         if (str > 100) str = 100;
@@ -465,7 +454,6 @@ static void enter_screen(ui_state_t *st, screen_t s)
     st->dirty        = true;
     st->scan_pending = false;
 
-#ifdef PICOOS_WIFI_ENABLE
     if (s == SCR_WIFI) {
         s_wifi_ucount    = 0;
         memset(s_wifi_chan_count, 0, sizeof(s_wifi_chan_count));
@@ -473,7 +461,6 @@ static void enter_screen(ui_state_t *st, screen_t s)
         wifi_scan();
         st->scan_pending = true;
     }
-#endif
 }
 
 static void back_to_home(ui_state_t *st)
@@ -509,7 +496,6 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
         break;
     }
     case SCR_WIFI: {
-#ifdef PICOOS_WIFI_ENABLE
         if (!st->scan_pending && s_wifi_ucount > 0) {
             if (pressed & DISP_BTN_A) {
                 if (st->sel > 0) {
@@ -535,7 +521,6 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
                 s_graph_head = 0;
             }
         }
-#endif
         if (pressed & DISP_BTN_Y) back_to_home(st);
         break;
     }
@@ -583,7 +568,6 @@ void netmon_entry(void *arg)
     uint8_t prev_btns = 0u;
 
     for (;;) {
-#ifdef PICOOS_WIFI_ENABLE
         if (st.screen == SCR_WIFI || st.screen == SCR_WIFI_DETAIL) {
             if (st.scan_pending && wifi_scan_is_done()) {
                 const wifi_scan_result_t *raw = NULL;
@@ -614,10 +598,9 @@ void netmon_entry(void *arg)
                 }
             }
         }
-#endif
         uint8_t btns    = 0u;
         dev_ioctl(DEV_DISPLAY, IOCTL_DISP_GET_BTNS, &btns);
-        uint8_t pressed = (uint8_t)(btns & ~prev_btns);
+        uint8_t pressed = (uint8_t)(btns & ~prev_btns);  /* rising-edge detect */
         prev_btns = btns;
 
         handle_input(&st, pressed);

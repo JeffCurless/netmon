@@ -40,7 +40,6 @@ else()
     # its own source directory, not the project root.
     set(PICOOS_APP_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/app_table.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/apps/myapp.c
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/netmon.c
     )
     set(PICOOS_APP_INCLUDE_DIRS
