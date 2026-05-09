@@ -34,7 +34,7 @@
 #define COLOR_ORANGE RGB332(255, 165,   0)   /* orange   — limited WiFi signal  */
 
 /* ---- scan timing ---------------------------------------------------------- */
-#define RESCAN_DELAY_TICKS  60u   /* 60 × 50 ms = 3 s between scan cycles */
+#define RESCAN_DELAY_TICKS  40u   /* 40 × 50 ms = 2 s between scan cycles */
 
 /* ---- graph geometry ------------------------------------------------------- */
 #define GRAPH_H     100u
@@ -342,15 +342,16 @@ static void render_about(void)
     uint32_t used = 0u, free_bytes = 0u, largest = 0u;
     kmem_stats(&used, &free_bytes, &largest);
 
-    char lines[5][20];
-    snprintf(lines[0], sizeof(lines[0]), "picoOS v%d.%d.%d",
+    char lines[6][20];
+    snprintf(lines[0], sizeof(lines[0]), "NetMon: v" NETMON_VERSION);
+    snprintf(lines[1], sizeof(lines[1]), "picoOS: v%d.%d.%d",
              PICOOS_VERSION_MAJOR, PICOOS_VERSION_MINOR, PICOOS_VERSION_EDIT);
-    snprintf(lines[1], sizeof(lines[1]), "%s", "NetMon v" NETMON_VERSION);
-    snprintf(lines[2], sizeof(lines[2]), "Used: %5u B", (unsigned)used);
-    snprintf(lines[3], sizeof(lines[3]), "Free: %5u B", (unsigned)free_bytes);
-    snprintf(lines[4], sizeof(lines[4]), "Max:  %5u B", (unsigned)largest);
+    snprintf(lines[2], sizeof(lines[2]), "Memory:");
+    snprintf(lines[3], sizeof(lines[3]), " Free: %5u B", (unsigned)free_bytes);
+    snprintf(lines[4], sizeof(lines[4]), " Used: %5u B", (unsigned)used);
+    snprintf(lines[5], sizeof(lines[5]), " Max:  %5u B", (unsigned)largest);
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         int y = (int)TITLE_H + i * (int)ROW_H + ((int)ROW_H - 16) / 2;
         disp_text_arg_t t = {
             .x = TEXT_X, .y = (uint16_t)y,
