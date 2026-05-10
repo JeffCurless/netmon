@@ -1,7 +1,7 @@
 /*
  * netmon.c — NetMon display UI application
  *
- * Screens: Home → Bluetooth (stub) | WiFi (live scan) | About
+ * Screens: Home → Bluetooth (live scan) | WiFi (live scan) | About
  * Buttons: A=up  B=down  X=select  Y=back
  */
 
@@ -11,6 +11,9 @@
 #include "drivers/display.h"
 #include "netmon.h"
 #include "kernel/wifi.h"
+#ifdef PICOOS_BT_ENABLE
+#include "kernel/bluetooth.h"
+#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,7 +35,8 @@
 #define COLOR_ORANGE RGB332(255, 165,   0)   /* orange   — limited WiFi signal  */
 
 /* ---- scan timing ---------------------------------------------------------- */
-#define RESCAN_DELAY_TICKS  40u   /* 40 × 50 ms = 2 s between scan cycles */
+#define RESCAN_DELAY_TICKS     40u  /* 40 × 50 ms = 2 s between WiFi scan cycles */
+#define BT_RESCAN_DELAY_TICKS 120u  /* 120 × 50 ms = 6 s pause after BT scan completes */
 
 /* ---- graph geometry ------------------------------------------------------- */
 #define GRAPH_H     100u
@@ -50,7 +54,7 @@
 #define VISIBLE_ROWS  ((DISP_HEIGHT - TITLE_H) / ROW_H)
 
 /* ---- state ---------------------------------------------------------------- */
-typedef enum { SCR_HOME = 0, SCR_WIFI, SCR_BT, SCR_ABOUT, SCR_WIFI_DETAIL } screen_t;
+typedef enum { SCR_HOME = 0, SCR_WIFI, SCR_BT, SCR_BT_DETAIL, SCR_ABOUT, SCR_WIFI_DETAIL } screen_t;
 
 typedef struct {
     screen_t screen;
@@ -62,8 +66,13 @@ typedef struct {
     int      wifi_scroll;
     int      detail_idx;    /* s_wifi_cache index shown in the detail panel */
     int      rescan_ticks;  /* countdown to next WiFi scan trigger (50 ms ticks) */
+    int      bt_sel;        /* BT list cursor saved when entering detail panel */
+    int      bt_scroll;
+    int      bt_detail_idx; /* s_bt_cache index shown in the BT detail panel */
+    int      bt_rescan_ticks;
     bool     dirty;
     bool     scan_pending;
+    bool     bt_scan_pending;
 } ui_state_t;
 
 /* ---- WiFi result cache ---------------------------------------------------- */
@@ -79,6 +88,78 @@ static int     s_wifi_chan_count[WIFI_MAX_SCAN_RESULTS];
  * 0 is used as the "no data" sentinel; real RSSI values are always < 0. */
 static int8_t s_rssi_history[DISP_WIDTH];
 static int    s_graph_head = 0;   /* index of next write position */
+
+/* ---- Bluetooth result cache ----------------------------------------------- */
+#ifdef PICOOS_BT_ENABLE
+static bt_scan_result_t s_bt_cache[BT_MAX_SCAN_RESULTS];
+static int              s_bt_count = 0;
+static int8_t           s_bt_rssi_history[DISP_WIDTH];
+static int              s_bt_graph_head = 0;
+
+/* Returns the number of changes made (new devices added or fields updated). */
+static int merge_bt_into_cache(const bt_scan_result_t *raw, int count)
+{
+    int changes = 0;
+    for (int i = 0; i < count; i++) {
+        int found = -1;
+        for (int j = 0; j < s_bt_count; j++) {
+            if (memcmp(raw[i].addr, s_bt_cache[j].addr, BT_ADDR_LEN) == 0) {
+                found = j;
+                break;
+            }
+        }
+        if (found >= 0) {
+            if (s_bt_cache[found].rssi != raw[i].rssi) {
+                s_bt_cache[found].rssi = raw[i].rssi;
+                changes++;
+            }
+            if (raw[i].name[0] != '\0' &&
+                strcmp(s_bt_cache[found].name, raw[i].name) != 0) {
+                memcpy(s_bt_cache[found].name, raw[i].name, BT_NAME_LEN);
+                changes++;
+            }
+            if (raw[i].tx_power != BT_TX_POWER_UNKNOWN &&
+                s_bt_cache[found].tx_power != raw[i].tx_power) {
+                s_bt_cache[found].tx_power = raw[i].tx_power;
+                changes++;
+            }
+            if (raw[i].flags != BT_FLAGS_NONE &&
+                s_bt_cache[found].flags != raw[i].flags) {
+                s_bt_cache[found].flags = raw[i].flags;
+                changes++;
+            }
+            if (raw[i].company_id != BT_COMPANY_NONE &&
+                s_bt_cache[found].company_id != raw[i].company_id) {
+                s_bt_cache[found].company_id = raw[i].company_id;
+                changes++;
+            }
+        } else if (s_bt_count < BT_MAX_SCAN_RESULTS) {
+            s_bt_cache[s_bt_count++] = raw[i];
+            changes++;
+        }
+    }
+    return changes;
+}
+
+static const char *bt_company_name(uint16_t id)
+{
+    static const struct { uint16_t id; const char *name; } tbl[] = {
+        { 0x0006, "Microsoft"  },
+        { 0x004C, "Apple"      },
+        { 0x0059, "Nordic Semi"},
+        { 0x0075, "Samsung"    },
+        { 0x0087, "Garmin"     },
+        { 0x00D7, "Arduino"    },
+        { 0x00E0, "Google"     },
+        { 0x0138, "Fitbit"     },
+        { 0x0171, "Amazon"     },
+        { 0x02E5, "Espressif"  },
+    };
+    for (int i = 0; i < (int)(sizeof tbl / sizeof tbl[0]); i++)
+        if (tbl[i].id == id) return tbl[i].name;
+    return NULL;
+}
+#endif
 
 /* ---- WiFi helpers --------------------------------------------------------- */
 
@@ -315,42 +396,7 @@ static void render_wifi(ui_state_t *st)
     }
 }
 
-static void render_bt(void)
-{
-    draw_title("Bluetooth Devices");
-    clear_content();
-    draw_message("No devices found");
-}
-
-static void render_about(void)
-{
-    draw_title("About");
-    clear_content();
-
-    uint32_t used = 0u, free_bytes = 0u, largest = 0u;
-    kmem_stats(&used, &free_bytes, &largest);
-
-    char lines[6][20];
-    snprintf(lines[0], sizeof(lines[0]), "NetMon: v" NETMON_VERSION);
-    snprintf(lines[1], sizeof(lines[1]), "picoOS: v%d.%d.%d",
-             PICOOS_VERSION_MAJOR, PICOOS_VERSION_MINOR, PICOOS_VERSION_EDIT);
-    snprintf(lines[2], sizeof(lines[2]), "Memory:");
-    snprintf(lines[3], sizeof(lines[3]), " Free: %5u B", (unsigned)free_bytes);
-    snprintf(lines[4], sizeof(lines[4]), " Used: %5u B", (unsigned)used);
-    snprintf(lines[5], sizeof(lines[5]), " Max:  %5u B", (unsigned)largest);
-
-    for (int i = 0; i < 6; i++) {
-        int y = (int)TITLE_H + i * (int)ROW_H + ((int)ROW_H - 16) / 2;
-        disp_text_arg_t t = {
-            .x = TEXT_X, .y = (uint16_t)y,
-            .color = COLOR_GREY, .bg = COLOR_PANEL, .scale = 2, ._pad = 0,
-            .str = lines[i]
-        };
-        dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_TEXT, &t);
-    }
-}
-
-static void render_graph(void)
+static void render_rssi_graph(const int8_t *history, int head)
 {
     disp_rect_arg_t bg = {
         .x = 0, .y = GRAPH_Y_TOP, .w = DISP_WIDTH, .h = GRAPH_H,
@@ -359,10 +405,10 @@ static void render_graph(void)
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &bg);
 
     for (int x = 0; x < (int)DISP_WIDTH; x++) {
-        int gap_rel = (x - s_graph_head + (int)DISP_WIDTH) % (int)DISP_WIDTH;
+        int gap_rel = (x - head + (int)DISP_WIDTH) % (int)DISP_WIDTH;
         if (gap_rel < (int)GRAPH_GAP_W) continue;
 
-        int8_t rv = s_rssi_history[x];
+        int8_t rv = history[x];
         if (rv == 0) continue;
 
         /* Map RSSI (-100..-30 dBm) → bar height 0..100 %. */
@@ -380,6 +426,114 @@ static void render_graph(void)
         dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &bar);
     }
 }
+
+#ifdef PICOOS_BT_ENABLE
+static void render_bt(ui_state_t *st)
+{
+    draw_title("Bluetooth Devices");
+    clear_content();
+
+    if (s_bt_count == 0) {
+        draw_message(st->bt_scan_pending ? "Scanning..." : "No devices found");
+        return;
+    }
+
+    for (int i = 0; i < s_bt_count; i++) {
+        int view = i - st->scroll;
+        if (view < 0 || view >= (int)VISIBLE_ROWS) continue;
+        const bt_scan_result_t *dev = &s_bt_cache[i];
+        const char *nm = dev->name[0] ? dev->name : "Unknown";
+        char line[20];
+        snprintf(line, sizeof(line), "%-11.11s %4d", nm, (int)dev->rssi);
+        draw_row(view, line, rssi_color(dev->rssi), i == st->sel);
+    }
+}
+
+static void render_bt_detail(ui_state_t *st)
+{
+    int idx = st->bt_detail_idx;
+    if (idx < 0 || idx >= s_bt_count) {
+        draw_title("BT Detail");
+        clear_content();
+        draw_message("No data");
+        return;
+    }
+
+    const bt_scan_result_t *dev = &s_bt_cache[idx];
+
+    char title[20];
+    snprintf(title, sizeof(title), "%.18s", dev->name[0] ? dev->name : "BT Device");
+    draw_title(title);
+    clear_content();
+
+    /* Row 0: RSSI with signal quality color */
+    char rssi_line[20];
+    snprintf(rssi_line, sizeof(rssi_line), "RSSI: %ddBm", (int)dev->rssi);
+    draw_detail_row(0, rssi_line, rssi_color(dev->rssi));
+
+    /* Row 1: device type */
+    char type_line[20];
+    snprintf(type_line, sizeof(type_line), "Type: %s",
+             dev->type == BT_DEVTYPE_BLE ? "BLE" : "Classic");
+    draw_detail_row(1, type_line, COLOR_GREY);
+
+    char addr_str[20];
+    const uint8_t *a = dev->addr;
+    snprintf(addr_str, sizeof(addr_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             a[0], a[1], a[2], a[3], a[4], a[5]);
+
+    if (dev->type == BT_DEVTYPE_BLE) {
+        /* BLE rows 2-4: TX power, flags, manufacturer company */
+        char txpwr_line[20];
+        if (dev->tx_power == BT_TX_POWER_UNKNOWN)
+            snprintf(txpwr_line, sizeof(txpwr_line), "TxPwr: N/A");
+        else
+            snprintf(txpwr_line, sizeof(txpwr_line), "TxPwr: %ddBm", (int)dev->tx_power);
+        draw_detail_row(2, txpwr_line, COLOR_GREY);
+
+        char flags_line[20];
+        if (dev->flags == BT_FLAGS_NONE)
+            snprintf(flags_line, sizeof(flags_line), "Flags: N/A");
+        else
+            snprintf(flags_line, sizeof(flags_line), "Flags: 0x%02X", dev->flags);
+        draw_detail_row(3, flags_line, COLOR_GREY);
+
+        char co_line[20];
+        if (dev->company_id == BT_COMPANY_NONE) {
+            snprintf(co_line, sizeof(co_line), "Co:   N/A");
+        } else {
+            const char *co = bt_company_name(dev->company_id);
+            if (co)
+                snprintf(co_line, sizeof(co_line), "Co:   %s", co);
+            else
+                snprintf(co_line, sizeof(co_line), "Co:   0x%04X", dev->company_id);
+        }
+        draw_detail_row(4, co_line, COLOR_GREY);
+
+        /* Row 5: MAC address */
+        draw_detail_row(5, addr_str, COLOR_GREY);
+    } else {
+        /* Classic rows 2-3: device class, MAC address */
+        char class_line[20];
+        snprintf(class_line, sizeof(class_line), "Cls:  %s",
+                 bt_devclass_str(dev->dev_class));
+        draw_detail_row(2, class_line, COLOR_GREY);
+
+        /* Row 3: MAC address */
+        draw_detail_row(3, addr_str, COLOR_GREY);
+    }
+
+    render_rssi_graph(s_bt_rssi_history, s_bt_graph_head);
+}
+#else
+static void render_bt(ui_state_t *st)
+{
+    (void)st;
+    draw_title("Bluetooth Devices");
+    clear_content();
+    draw_message("Not available");
+}
+#endif
 
 static void render_wifi_detail(ui_state_t *st)
 {
@@ -427,7 +581,35 @@ static void render_wifi_detail(ui_state_t *st)
              b[0], b[1], b[2], b[3], b[4], b[5]);
     draw_detail_row(3, bssid_str, COLOR_GREY);
 
-    render_graph();
+    render_rssi_graph(s_rssi_history, s_graph_head);
+}
+
+static void render_about(void)
+{
+    draw_title("About");
+    clear_content();
+
+    uint32_t used = 0u, free_bytes = 0u, largest = 0u;
+    kmem_stats(&used, &free_bytes, &largest);
+
+    char lines[6][20];
+    snprintf(lines[0], sizeof(lines[0]), "NetMon: v" NETMON_VERSION);
+    snprintf(lines[1], sizeof(lines[1]), "picoOS: v%d.%d.%d",
+             PICOOS_VERSION_MAJOR, PICOOS_VERSION_MINOR, PICOOS_VERSION_EDIT);
+    snprintf(lines[2], sizeof(lines[2]), "Memory:");
+    snprintf(lines[3], sizeof(lines[3]), " Free: %5u B", (unsigned)free_bytes);
+    snprintf(lines[4], sizeof(lines[4]), " Used: %5u B", (unsigned)used);
+    snprintf(lines[5], sizeof(lines[5]), " Max:  %5u B", (unsigned)largest);
+
+    for (int i = 0; i < 6; i++) {
+        int y = (int)TITLE_H + i * (int)ROW_H + ((int)ROW_H - 16) / 2;
+        disp_text_arg_t t = {
+            .x = TEXT_X, .y = (uint16_t)y,
+            .color = COLOR_GREY, .bg = COLOR_PANEL, .scale = 2, ._pad = 0,
+            .str = lines[i]
+        };
+        dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_TEXT, &t);
+    }
 }
 
 static void render_screen(ui_state_t *st)
@@ -435,7 +617,12 @@ static void render_screen(ui_state_t *st)
     switch (st->screen) {
     case SCR_HOME:        render_home(st);        break;
     case SCR_WIFI:        render_wifi(st);        break;
-    case SCR_BT:          render_bt();            break;
+    case SCR_BT:          render_bt(st);          break;
+#ifdef PICOOS_BT_ENABLE
+    case SCR_BT_DETAIL:   render_bt_detail(st);   break;
+#else
+    case SCR_BT_DETAIL:   render_bt(st);          break;
+#endif
     case SCR_ABOUT:       render_about();         break;
     case SCR_WIFI_DETAIL: render_wifi_detail(st); break;
     }
@@ -461,16 +648,26 @@ static void enter_screen(ui_state_t *st, screen_t s)
         wifi_scan();
         st->scan_pending = true;
     }
+#ifdef PICOOS_BT_ENABLE
+    if (s == SCR_BT) {
+        s_bt_count           = 0;
+        st->bt_rescan_ticks  = 0;
+        bt_scan();
+        st->bt_scan_pending  = true;
+    }
+#endif
 }
 
 static void back_to_home(ui_state_t *st)
 {
-    st->screen       = SCR_HOME;
-    st->sel          = st->prev_sel;
-    st->scroll       = st->prev_scroll;
-    st->rescan_ticks = 0;
-    st->dirty        = true;
-    st->scan_pending = false;
+    st->screen          = SCR_HOME;
+    st->sel             = st->prev_sel;
+    st->scroll          = st->prev_scroll;
+    st->rescan_ticks    = 0;
+    st->bt_rescan_ticks = 0;
+    st->dirty           = true;
+    st->scan_pending    = false;
+    st->bt_scan_pending = false;
 }
 
 static void handle_input(ui_state_t *st, uint8_t pressed)
@@ -532,7 +729,50 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
             st->dirty  = true;
         }
         break;
+#ifdef PICOOS_BT_ENABLE
+    case SCR_BT: {
+        if (s_bt_count > 0) {
+            if (pressed & DISP_BTN_A) {
+                if (st->sel > 0) {
+                    st->sel--;
+                    adjust_scroll(st, s_bt_count);
+                    st->dirty = true;
+                }
+            }
+            if (pressed & DISP_BTN_B) {
+                if (st->sel < s_bt_count - 1) {
+                    st->sel++;
+                    adjust_scroll(st, s_bt_count);
+                    st->dirty = true;
+                }
+            }
+            if (pressed & DISP_BTN_X) {
+                st->bt_sel       = st->sel;
+                st->bt_scroll    = st->scroll;
+                st->bt_detail_idx = st->sel;
+                st->screen       = SCR_BT_DETAIL;
+                st->dirty        = true;
+                memset(s_bt_rssi_history, 0, sizeof(s_bt_rssi_history));
+                s_bt_graph_head  = 0;
+            }
+        }
+        if (pressed & DISP_BTN_Y) back_to_home(st);
+        break;
+    }
+    case SCR_BT_DETAIL:
+        if (pressed & DISP_BTN_Y) {
+            st->screen = SCR_BT;
+            st->sel    = st->bt_sel;
+            st->scroll = st->bt_scroll;
+            st->dirty  = true;
+        }
+        break;
+#else
     case SCR_BT:
+    case SCR_BT_DETAIL:
+        if (pressed & DISP_BTN_Y) back_to_home(st);
+        break;
+#endif
     case SCR_ABOUT:
         if (pressed & DISP_BTN_Y) back_to_home(st);
         break;
@@ -553,17 +793,22 @@ void netmon_entry(void *arg)
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_FLUSH, NULL);
 
     ui_state_t st = {
-        .screen        = SCR_HOME,
-        .sel           = 0,
-        .scroll        = 0,
-        .prev_sel      = 0,
-        .prev_scroll   = 0,
-        .wifi_sel      = 0,
-        .wifi_scroll   = 0,
-        .detail_idx    = 0,
-        .rescan_ticks  = 0,
-        .dirty         = true,
-        .scan_pending  = false,
+        .screen           = SCR_HOME,
+        .sel              = 0,
+        .scroll           = 0,
+        .prev_sel         = 0,
+        .prev_scroll      = 0,
+        .wifi_sel         = 0,
+        .wifi_scroll      = 0,
+        .detail_idx       = 0,
+        .rescan_ticks     = 0,
+        .bt_sel           = 0,
+        .bt_scroll        = 0,
+        .bt_detail_idx    = 0,
+        .bt_rescan_ticks  = 0,
+        .dirty            = true,
+        .scan_pending     = false,
+        .bt_scan_pending  = false,
     };
     uint8_t prev_btns = 0u;
 
@@ -598,6 +843,47 @@ void netmon_entry(void *arg)
                 }
             }
         }
+#ifdef PICOOS_BT_ENABLE
+        if (st.screen == SCR_BT || st.screen == SCR_BT_DETAIL) {
+            if (st.bt_scan_pending) {
+                /* Live update: merge partial results on every tick so devices
+                 * appear as they are discovered rather than at scan end. */
+                const bt_scan_result_t *raw = NULL;
+                int raw_count = 0;
+                bt_get_scan_results(&raw, &raw_count);
+                if (raw_count > 0) {
+                    int old_count = s_bt_count;
+                    if (merge_bt_into_cache(raw, raw_count) > 0) {
+                        if (st.screen == SCR_BT && s_bt_count != old_count) {
+                            if (st.sel >= s_bt_count)
+                                st.sel = s_bt_count > 0 ? s_bt_count - 1 : 0;
+                            adjust_scroll(&st, s_bt_count);
+                        }
+                        st.dirty = true;
+                    }
+                }
+                /* Scan complete: record RSSI graph point and schedule rescan. */
+                if (bt_scan_is_done()) {
+                    if (st.screen == SCR_BT_DETAIL &&
+                        st.bt_detail_idx >= 0 && st.bt_detail_idx < s_bt_count) {
+                        s_bt_rssi_history[s_bt_graph_head] =
+                            (int8_t)s_bt_cache[st.bt_detail_idx].rssi;
+                        s_bt_graph_head = (s_bt_graph_head + 1) % (int)DISP_WIDTH;
+                    }
+                    st.bt_scan_pending  = false;
+                    st.dirty            = true;
+                    st.bt_rescan_ticks  = BT_RESCAN_DELAY_TICKS;
+                }
+            } else if (st.bt_rescan_ticks > 0) {
+                /* No cache clear on periodic rescan — accumulate devices across
+                 * cycles; merge updates RSSI when a device reappears. */
+                if (--st.bt_rescan_ticks == 0) {
+                    bt_scan();
+                    st.bt_scan_pending = true;
+                }
+            }
+        }
+#endif
         uint8_t btns    = 0u;
         dev_ioctl(DEV_DISPLAY, IOCTL_DISP_GET_BTNS, &btns);
         uint8_t pressed = (uint8_t)(btns & ~prev_btns);  /* rising-edge detect */
