@@ -11,9 +11,7 @@
 #include "drivers/display.h"
 #include "netmon.h"
 #include "kernel/wifi.h"
-#ifdef PICOOS_BT_ENABLE
 #include "kernel/bluetooth.h"
-#endif
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -90,7 +88,6 @@ static int8_t s_rssi_history[DISP_WIDTH];
 static int    s_graph_head = 0;   /* index of next write position */
 
 /* ---- Bluetooth result cache ----------------------------------------------- */
-#ifdef PICOOS_BT_ENABLE
 static bt_scan_result_t s_bt_cache[BT_MAX_SCAN_RESULTS];
 static int              s_bt_count = 0;
 static int8_t           s_bt_rssi_history[DISP_WIDTH];
@@ -159,7 +156,6 @@ static const char *bt_company_name(uint16_t id)
         if (tbl[i].id == id) return tbl[i].name;
     return NULL;
 }
-#endif
 
 /* ---- WiFi helpers --------------------------------------------------------- */
 
@@ -427,7 +423,6 @@ static void render_rssi_graph(const int8_t *history, int head)
     }
 }
 
-#ifdef PICOOS_BT_ENABLE
 static void render_bt(ui_state_t *st)
 {
     draw_title("Bluetooth Devices");
@@ -525,15 +520,6 @@ static void render_bt_detail(ui_state_t *st)
 
     render_rssi_graph(s_bt_rssi_history, s_bt_graph_head);
 }
-#else
-static void render_bt(ui_state_t *st)
-{
-    (void)st;
-    draw_title("Bluetooth Devices");
-    clear_content();
-    draw_message("Not available");
-}
-#endif
 
 static void render_wifi_detail(ui_state_t *st)
 {
@@ -618,11 +604,7 @@ static void render_screen(ui_state_t *st)
     case SCR_HOME:        render_home(st);        break;
     case SCR_WIFI:        render_wifi(st);        break;
     case SCR_BT:          render_bt(st);          break;
-#ifdef PICOOS_BT_ENABLE
     case SCR_BT_DETAIL:   render_bt_detail(st);   break;
-#else
-    case SCR_BT_DETAIL:   render_bt(st);          break;
-#endif
     case SCR_ABOUT:       render_about();         break;
     case SCR_WIFI_DETAIL: render_wifi_detail(st); break;
     }
@@ -648,14 +630,12 @@ static void enter_screen(ui_state_t *st, screen_t s)
         wifi_scan();
         st->scan_pending = true;
     }
-#ifdef PICOOS_BT_ENABLE
     if (s == SCR_BT) {
         s_bt_count           = 0;
         st->bt_rescan_ticks  = 0;
         bt_scan();
         st->bt_scan_pending  = true;
     }
-#endif
 }
 
 static void back_to_home(ui_state_t *st)
@@ -729,7 +709,6 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
             st->dirty  = true;
         }
         break;
-#ifdef PICOOS_BT_ENABLE
     case SCR_BT: {
         if (s_bt_count > 0) {
             if (pressed & DISP_BTN_A) {
@@ -747,13 +726,13 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
                 }
             }
             if (pressed & DISP_BTN_X) {
-                st->bt_sel       = st->sel;
-                st->bt_scroll    = st->scroll;
+                st->bt_sel        = st->sel;
+                st->bt_scroll     = st->scroll;
                 st->bt_detail_idx = st->sel;
-                st->screen       = SCR_BT_DETAIL;
-                st->dirty        = true;
+                st->screen        = SCR_BT_DETAIL;
+                st->dirty         = true;
                 memset(s_bt_rssi_history, 0, sizeof(s_bt_rssi_history));
-                s_bt_graph_head  = 0;
+                s_bt_graph_head   = 0;
             }
         }
         if (pressed & DISP_BTN_Y) back_to_home(st);
@@ -767,12 +746,6 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
             st->dirty  = true;
         }
         break;
-#else
-    case SCR_BT:
-    case SCR_BT_DETAIL:
-        if (pressed & DISP_BTN_Y) back_to_home(st);
-        break;
-#endif
     case SCR_ABOUT:
         if (pressed & DISP_BTN_Y) back_to_home(st);
         break;
@@ -843,7 +816,6 @@ void netmon_entry(void *arg)
                 }
             }
         }
-#ifdef PICOOS_BT_ENABLE
         if (st.screen == SCR_BT || st.screen == SCR_BT_DETAIL) {
             if (st.bt_scan_pending) {
                 /* Live update: merge partial results on every tick so devices
@@ -883,7 +855,6 @@ void netmon_entry(void *arg)
                 }
             }
         }
-#endif
         uint8_t btns    = 0u;
         dev_ioctl(DEV_DISPLAY, IOCTL_DISP_GET_BTNS, &btns);
         uint8_t pressed = (uint8_t)(btns & ~prev_btns);  /* rising-edge detect */
