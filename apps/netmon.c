@@ -6,6 +6,8 @@
  */
 
 #include "kernel/syscall.h"
+#include "kernel/task.h"
+#include "kernel/sync.h"
 #include "kernel/dev.h"
 #include "kernel/mem.h"
 #include "drivers/display.h"
@@ -33,8 +35,10 @@
 #define COLOR_ORANGE RGB332(255, 165,   0)   /* orange   — limited WiFi signal  */
 
 /* ---- scan timing ---------------------------------------------------------- */
-#define RESCAN_DELAY_TICKS     40u  /* 40 × 50 ms = 2 s between WiFi scan cycles */
-#define BT_RESCAN_DELAY_TICKS 120u  /* 120 × 50 ms = 6 s pause after BT scan completes */
+#define WIFI_RESCAN_MS    2000u   /* pause between WiFi scan cycles           */
+#define BT_RESCAN_MS      6000u   /* pause after BT scan completes            */
+#define WIFI_SCAN_TIMEOUT_MS 15000u  /* abort if scan never completes (bus error guard) */
+#define BT_SCAN_TIMEOUT_MS   12000u  /* abort if BT scan never completes      */
 
 /* ---- graph geometry ------------------------------------------------------- */
 #define GRAPH_H     100u
@@ -63,20 +67,25 @@ typedef struct {
     int      wifi_sel;      /* WiFi list cursor saved when entering detail panel */
     int      wifi_scroll;
     int      detail_idx;    /* s_wifi_cache index shown in the detail panel */
-    int      rescan_ticks;  /* countdown to next WiFi scan trigger (50 ms ticks) */
     int      bt_sel;        /* BT list cursor saved when entering detail panel */
     int      bt_scroll;
     int      bt_detail_idx; /* s_bt_cache index shown in the BT detail panel */
-    int      bt_rescan_ticks;
     bool     dirty;
-    bool     scan_pending;
-    bool     bt_scan_pending;
 } ui_state_t;
+
+/* ---- cross-thread state (main thread ↔ scan worker on Core 1) ------------ */
+static spinlock_t        s_wifi_lock;        /* guards wifi cache writes     */
+static spinlock_t        s_bt_lock;          /* guards bt cache writes       */
+static volatile bool     s_new_wifi_data  = false;
+static volatile bool     s_new_bt_data    = false;
+static volatile screen_t s_active_screen  = SCR_HOME;
+static volatile bool     s_scanning_wifi  = false;
+static volatile bool     s_scanning_bt    = false;
 
 /* ---- WiFi result cache ---------------------------------------------------- */
 
 static wifi_scan_result_t s_wifi_cache[WIFI_MAX_SCAN_RESULTS];
-static int                s_wifi_ucount = 0;
+static volatile int       s_wifi_ucount = 0;
 
 #define MAX_CHANS_PER_SSID  8u
 static uint8_t s_wifi_chans[WIFI_MAX_SCAN_RESULTS][MAX_CHANS_PER_SSID];
@@ -89,7 +98,7 @@ static int    s_graph_head = 0;   /* index of next write position */
 
 /* ---- Bluetooth result cache ----------------------------------------------- */
 static bt_scan_result_t s_bt_cache[BT_MAX_SCAN_RESULTS];
-static int              s_bt_count = 0;
+static volatile int     s_bt_count = 0;
 static int8_t           s_bt_rssi_history[DISP_WIDTH];
 static int              s_bt_graph_head = 0;
 
@@ -130,8 +139,14 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count)
                 s_bt_cache[found].company_id = raw[i].company_id;
                 changes++;
             }
+            if (raw[i].service_uuid != BT_SERVICE_NONE &&
+                s_bt_cache[found].service_uuid != raw[i].service_uuid) {
+                s_bt_cache[found].service_uuid = raw[i].service_uuid;
+                changes++;
+            }
         } else if (s_bt_count < BT_MAX_SCAN_RESULTS) {
-            s_bt_cache[s_bt_count++] = raw[i];
+            s_bt_cache[s_bt_count] = raw[i];
+            s_bt_count++;           /* increment after full write */
             changes++;
         }
     }
@@ -151,9 +166,25 @@ static const char *bt_company_name(uint16_t id)
         { 0x0138, "Fitbit"     },
         { 0x0171, "Amazon"     },
         { 0x02E5, "Espressif"  },
+        { 0x4C42, "Epson"      },
     };
     for (int i = 0; i < (int)(sizeof tbl / sizeof tbl[0]); i++)
         if (tbl[i].id == id) return tbl[i].name;
+    return NULL;
+}
+
+/* Map a 16-bit BT SIG Member Service UUID to a company name.
+ * UUIDs in the 0xFExx range are assigned to companies by the Bluetooth SIG. */
+static const char *bt_service_name(uint16_t uuid)
+{
+    static const struct { uint16_t uuid; const char *name; } tbl[] = {
+        { 0xFE96, "Tesla"      },
+        { 0xFE97, "Tesla"      },
+        { 0xFEAF, "Nest Labs"  },
+        { 0xFEB0, "Nest Labs"  },
+    };
+    for (int i = 0; i < (int)(sizeof tbl / sizeof tbl[0]); i++)
+        if (tbl[i].uuid == uuid) return tbl[i].name;
     return NULL;
 }
 
@@ -250,10 +281,11 @@ static void merge_into_cache(const wifi_scan_result_t *raw,
             if (!ch_seen && s_wifi_chan_count[found] < (int)MAX_CHANS_PER_SSID)
                 s_wifi_chans[found][s_wifi_chan_count[found]++] = r->channel;
         } else if (s_wifi_ucount < WIFI_MAX_SCAN_RESULTS) {
-            int n = s_wifi_ucount++;
+            int n = s_wifi_ucount;
             s_wifi_cache[n]       = *r;
             s_wifi_chan_count[n]  = 1;
             s_wifi_chans[n][0]   = r->channel;
+            s_wifi_ucount = n + 1;  /* increment after full write */
         }
     }
 }
@@ -378,7 +410,7 @@ static void render_wifi(ui_state_t *st)
     clear_content();
 
     if (s_wifi_ucount == 0) {
-        draw_message(st->scan_pending ? "Scanning..." : "No networks found");
+        draw_message(s_scanning_wifi ? "Scanning..." : "No networks found");
         return;
     }
 
@@ -429,7 +461,7 @@ static void render_bt(ui_state_t *st)
     clear_content();
 
     if (s_bt_count == 0) {
-        draw_message(st->bt_scan_pending ? "Scanning..." : "No devices found");
+        draw_message(s_scanning_bt ? "Scanning..." : "No devices found");
         return;
     }
 
@@ -478,35 +510,37 @@ static void render_bt_detail(ui_state_t *st)
              a[0], a[1], a[2], a[3], a[4], a[5]);
 
     if (dev->type == BT_DEVTYPE_BLE) {
-        /* BLE rows 2-4: TX power, flags, manufacturer company */
-        char txpwr_line[20];
-        if (dev->tx_power == BT_TX_POWER_UNKNOWN)
-            snprintf(txpwr_line, sizeof(txpwr_line), "TxPwr: N/A");
-        else
-            snprintf(txpwr_line, sizeof(txpwr_line), "TxPwr: %ddBm", (int)dev->tx_power);
-        draw_detail_row(2, txpwr_line, COLOR_GREY);
+        /* BLE optional fields: only emit rows that have real values. */
+        int row = 2;
+        char tmp[20];
 
-        char flags_line[20];
-        if (dev->flags == BT_FLAGS_NONE)
-            snprintf(flags_line, sizeof(flags_line), "Flags: N/A");
-        else
-            snprintf(flags_line, sizeof(flags_line), "Flags: 0x%02X", dev->flags);
-        draw_detail_row(3, flags_line, COLOR_GREY);
+        if (dev->tx_power != BT_TX_POWER_UNKNOWN) {
+            snprintf(tmp, sizeof(tmp), "TxPwr: %ddBm", (int)dev->tx_power);
+            draw_detail_row(row++, tmp, COLOR_GREY);
+        }
 
-        char co_line[20];
-        if (dev->company_id == BT_COMPANY_NONE) {
-            snprintf(co_line, sizeof(co_line), "Co:   N/A");
-        } else {
+        if (dev->flags != BT_FLAGS_NONE) {
+            snprintf(tmp, sizeof(tmp), "Flags: 0x%02X", dev->flags);
+            draw_detail_row(row++, tmp, COLOR_GREY);
+        }
+
+        if (dev->company_id != BT_COMPANY_NONE) {
             const char *co = bt_company_name(dev->company_id);
             if (co)
-                snprintf(co_line, sizeof(co_line), "Co:   %s", co);
+                snprintf(tmp, sizeof(tmp), "Co:   %s", co);
             else
-                snprintf(co_line, sizeof(co_line), "Co:   0x%04X", dev->company_id);
+                snprintf(tmp, sizeof(tmp), "Co:   0x%04X", dev->company_id);
+            draw_detail_row(row++, tmp, COLOR_GREY);
+        } else if (dev->service_uuid != BT_SERVICE_NONE) {
+            const char *sn = bt_service_name(dev->service_uuid);
+            if (sn)
+                snprintf(tmp, sizeof(tmp), "Svc:  %s", sn);
+            else
+                snprintf(tmp, sizeof(tmp), "Svc:  0x%04X", dev->service_uuid);
+            draw_detail_row(row++, tmp, COLOR_GREY);
         }
-        draw_detail_row(4, co_line, COLOR_GREY);
 
-        /* Row 5: MAC address */
-        draw_detail_row(5, addr_str, COLOR_GREY);
+        draw_detail_row(row, addr_str, COLOR_GREY);
     } else {
         /* Classic rows 2-3: device class, MAC address */
         char class_line[20];
@@ -621,33 +655,27 @@ static void enter_screen(ui_state_t *st, screen_t s)
     st->sel          = 0;
     st->scroll       = 0;
     st->dirty        = true;
-    st->scan_pending = false;
 
     if (s == SCR_WIFI) {
-        s_wifi_ucount    = 0;
+        spinlock_acquire(&s_wifi_lock);
+        s_wifi_ucount = 0;
         memset(s_wifi_chan_count, 0, sizeof(s_wifi_chan_count));
-        st->rescan_ticks = 0;
-        wifi_scan();
-        st->scan_pending = true;
+        spinlock_release(&s_wifi_lock);
+    } else if (s == SCR_BT) {
+        spinlock_acquire(&s_bt_lock);
+        s_bt_count = 0;
+        spinlock_release(&s_bt_lock);
     }
-    if (s == SCR_BT) {
-        s_bt_count           = 0;
-        st->bt_rescan_ticks  = 0;
-        bt_scan();
-        st->bt_scan_pending  = true;
-    }
+    s_active_screen = s;
 }
 
 static void back_to_home(ui_state_t *st)
 {
-    st->screen          = SCR_HOME;
-    st->sel             = st->prev_sel;
-    st->scroll          = st->prev_scroll;
-    st->rescan_ticks    = 0;
-    st->bt_rescan_ticks = 0;
-    st->dirty           = true;
-    st->scan_pending    = false;
-    st->bt_scan_pending = false;
+    st->screen = SCR_HOME;
+    st->sel    = st->prev_sel;
+    st->scroll = st->prev_scroll;
+    st->dirty  = true;
+    s_active_screen = SCR_HOME;
 }
 
 static void handle_input(ui_state_t *st, uint8_t pressed)
@@ -673,7 +701,7 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
         break;
     }
     case SCR_WIFI: {
-        if (!st->scan_pending && s_wifi_ucount > 0) {
+        if (s_wifi_ucount > 0) {
             if (pressed & DISP_BTN_A) {
                 if (st->sel > 0) {
                     st->sel--;
@@ -752,11 +780,80 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
     }
 }
 
+/* ---- scan worker (Core 1) ------------------------------------------------- *
+ * Manages WiFi and BT scan cycles so the main UI thread stays responsive.
+ * Communicates via volatile flags and spinlock-protected cache writes.       */
+
+static void scan_worker_entry(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        screen_t scr = s_active_screen;
+
+        if (scr == SCR_WIFI || scr == SCR_WIFI_DETAIL) {
+            s_scanning_wifi = true;
+            wifi_scan();
+            uint32_t wifi_elapsed = 0u;
+            while (!wifi_scan_is_done() &&
+                   wifi_elapsed < WIFI_SCAN_TIMEOUT_MS) {
+                sys_sleep(50);
+                wifi_elapsed += 50u;
+            }
+
+            const wifi_scan_result_t *raw = NULL;
+            int raw_count = 0;
+            wifi_get_scan_results(&raw, &raw_count);
+
+            if (raw_count > 0) {
+                int tmp_idx[WIFI_MAX_SCAN_RESULTS];
+                int new_ucount = build_dedup(raw, raw_count, tmp_idx,
+                                             WIFI_MAX_SCAN_RESULTS);
+                spinlock_acquire(&s_wifi_lock);
+                merge_into_cache(raw, tmp_idx, new_ucount);
+                spinlock_release(&s_wifi_lock);
+            }
+
+            s_scanning_wifi = false;
+            s_new_wifi_data = true;
+            sys_sleep(WIFI_RESCAN_MS);
+
+        } else if (scr == SCR_BT || scr == SCR_BT_DETAIL) {
+            s_scanning_bt = true;
+            bt_scan();
+            uint32_t bt_elapsed = 0u;
+            while (!bt_scan_is_done() &&
+                   bt_elapsed < BT_SCAN_TIMEOUT_MS) {
+                const bt_scan_result_t *raw = NULL;
+                int raw_count = 0;
+                bt_get_scan_results(&raw, &raw_count);
+                if (raw_count > 0) {
+                    spinlock_acquire(&s_bt_lock);
+                    int ch = merge_bt_into_cache(raw, raw_count);
+                    spinlock_release(&s_bt_lock);
+                    if (ch > 0) s_new_bt_data = true;
+                }
+                sys_sleep(50);
+                bt_elapsed += 50u;
+            }
+            s_scanning_bt = false;
+            s_new_bt_data = true;
+            sys_sleep(BT_RESCAN_MS);
+
+        } else {
+            sys_sleep(100);
+        }
+    }
+}
+
 /* ---- entry point ---------------------------------------------------------- */
 
 void netmon_entry(void *arg)
 {
     (void)arg;
+
+    spinlock_init(&s_wifi_lock);
+    spinlock_init(&s_bt_lock);
+    s_active_screen = SCR_HOME;
 
     dev_open(DEV_DISPLAY);
 
@@ -765,96 +862,68 @@ void netmon_entry(void *arg)
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_CLEAR, NULL);
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_FLUSH, NULL);
 
+    /* Spawn scan worker to handle WiFi/BT scan cycles in the background,
+     * keeping the UI thread free for input polling and rendering.
+     * Runs AFFINITY_ANY: CYW43 (poll mode) and BTstack route their radio
+     * IRQs through Core 0's NVIC, so radio calls must not be pinned to C1. */
+    pcb_t *proc = task_find_process(sys_getpid());
+    task_create_thread(proc, "scan-worker",
+                       scan_worker_entry, NULL,
+                       5u, DEFAULT_STACK_SIZE);
+
     ui_state_t st = {
-        .screen           = SCR_HOME,
-        .sel              = 0,
-        .scroll           = 0,
-        .prev_sel         = 0,
-        .prev_scroll      = 0,
-        .wifi_sel         = 0,
-        .wifi_scroll      = 0,
-        .detail_idx       = 0,
-        .rescan_ticks     = 0,
-        .bt_sel           = 0,
-        .bt_scroll        = 0,
-        .bt_detail_idx    = 0,
-        .bt_rescan_ticks  = 0,
-        .dirty            = true,
-        .scan_pending     = false,
-        .bt_scan_pending  = false,
+        .screen        = SCR_HOME,
+        .sel           = 0,
+        .scroll        = 0,
+        .prev_sel      = 0,
+        .prev_scroll   = 0,
+        .wifi_sel      = 0,
+        .wifi_scroll   = 0,
+        .detail_idx    = 0,
+        .bt_sel        = 0,
+        .bt_scroll     = 0,
+        .bt_detail_idx = 0,
+        .dirty         = true,
     };
     uint8_t prev_btns = 0u;
 
     for (;;) {
-        if (st.screen == SCR_WIFI || st.screen == SCR_WIFI_DETAIL) {
-            if (st.scan_pending && wifi_scan_is_done()) {
-                const wifi_scan_result_t *raw = NULL;
-                int raw_count = 0;
-                wifi_get_scan_results(&raw, &raw_count);
-                int tmp_idx[WIFI_MAX_SCAN_RESULTS];
-                int new_ucount = build_dedup(raw, raw_count, tmp_idx, WIFI_MAX_SCAN_RESULTS);
-                merge_into_cache(raw, tmp_idx, new_ucount);
-                if (st.screen == SCR_WIFI) {
-                    if (st.sel >= s_wifi_ucount)
-                        st.sel = s_wifi_ucount > 0 ? s_wifi_ucount - 1 : 0;
-                    adjust_scroll(&st, s_wifi_ucount);
-                }
-                /* Record a graph data point when the detail panel is open */
-                if (st.screen == SCR_WIFI_DETAIL &&
-                    st.detail_idx >= 0 && st.detail_idx < s_wifi_ucount) {
-                    s_rssi_history[s_graph_head] =
-                        (int8_t)s_wifi_cache[st.detail_idx].rssi;
-                    s_graph_head = (s_graph_head + 1) % (int)DISP_WIDTH;
-                }
-                st.scan_pending = false;
-                st.dirty        = true;
-                st.rescan_ticks = RESCAN_DELAY_TICKS;
-            } else if (!st.scan_pending && st.rescan_ticks > 0) {
-                if (--st.rescan_ticks == 0) {
-                    wifi_scan();
-                    st.scan_pending = true;
-                }
+        if (s_new_wifi_data &&
+            (st.screen == SCR_WIFI || st.screen == SCR_WIFI_DETAIL)) {
+            s_new_wifi_data = false;
+            int ucount = s_wifi_ucount;
+            if (st.screen == SCR_WIFI) {
+                if (st.sel >= ucount)
+                    st.sel = ucount > 0 ? ucount - 1 : 0;
+                adjust_scroll(&st, ucount);
             }
-        }
-        if (st.screen == SCR_BT || st.screen == SCR_BT_DETAIL) {
-            if (st.bt_scan_pending) {
-                /* Live update: merge partial results on every tick so devices
-                 * appear as they are discovered rather than at scan end. */
-                const bt_scan_result_t *raw = NULL;
-                int raw_count = 0;
-                bt_get_scan_results(&raw, &raw_count);
-                if (raw_count > 0) {
-                    int old_count = s_bt_count;
-                    if (merge_bt_into_cache(raw, raw_count) > 0) {
-                        if (st.screen == SCR_BT && s_bt_count != old_count) {
-                            if (st.sel >= s_bt_count)
-                                st.sel = s_bt_count > 0 ? s_bt_count - 1 : 0;
-                            adjust_scroll(&st, s_bt_count);
-                        }
-                        st.dirty = true;
-                    }
-                }
-                /* Scan complete: record RSSI graph point and schedule rescan. */
-                if (bt_scan_is_done()) {
-                    if (st.screen == SCR_BT_DETAIL &&
-                        st.bt_detail_idx >= 0 && st.bt_detail_idx < s_bt_count) {
-                        s_bt_rssi_history[s_bt_graph_head] =
-                            (int8_t)s_bt_cache[st.bt_detail_idx].rssi;
-                        s_bt_graph_head = (s_bt_graph_head + 1) % (int)DISP_WIDTH;
-                    }
-                    st.bt_scan_pending  = false;
-                    st.dirty            = true;
-                    st.bt_rescan_ticks  = BT_RESCAN_DELAY_TICKS;
-                }
-            } else if (st.bt_rescan_ticks > 0) {
-                /* No cache clear on periodic rescan — accumulate devices across
-                 * cycles; merge updates RSSI when a device reappears. */
-                if (--st.bt_rescan_ticks == 0) {
-                    bt_scan();
-                    st.bt_scan_pending = true;
-                }
+            if (st.screen == SCR_WIFI_DETAIL &&
+                st.detail_idx >= 0 && st.detail_idx < ucount) {
+                s_rssi_history[s_graph_head] =
+                    (int8_t)s_wifi_cache[st.detail_idx].rssi;
+                s_graph_head = (s_graph_head + 1) % (int)DISP_WIDTH;
             }
+            st.dirty = true;
         }
+
+        if (s_new_bt_data &&
+            (st.screen == SCR_BT || st.screen == SCR_BT_DETAIL)) {
+            s_new_bt_data = false;
+            int bcount = s_bt_count;
+            if (st.screen == SCR_BT) {
+                if (st.sel >= bcount)
+                    st.sel = bcount > 0 ? bcount - 1 : 0;
+                adjust_scroll(&st, bcount);
+            }
+            if (st.screen == SCR_BT_DETAIL &&
+                st.bt_detail_idx >= 0 && st.bt_detail_idx < bcount) {
+                s_bt_rssi_history[s_bt_graph_head] =
+                    (int8_t)s_bt_cache[st.bt_detail_idx].rssi;
+                s_bt_graph_head = (s_bt_graph_head + 1) % (int)DISP_WIDTH;
+            }
+            st.dirty = true;
+        }
+
         uint8_t btns    = 0u;
         dev_ioctl(DEV_DISPLAY, IOCTL_DISP_GET_BTNS, &btns);
         uint8_t pressed = (uint8_t)(btns & ~prev_btns);  /* rising-edge detect */
@@ -867,6 +936,6 @@ void netmon_entry(void *arg)
             st.dirty = false;
         }
 
-        sys_sleep(50);
+        sys_sleep(20);
     }
 }
