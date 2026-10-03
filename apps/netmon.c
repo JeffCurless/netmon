@@ -34,11 +34,17 @@
 #define COLOR_GREY   RGB332(190, 190, 190)   /* grey     — labels & static text */
 #define COLOR_ORANGE RGB332(255, 165,   0)   /* orange   — limited WiFi signal  */
 
-/* ---- scan timing ---------------------------------------------------------- */
-#define WIFI_RESCAN_MS    2000u   /* pause between WiFi scan cycles           */
-#define BT_RESCAN_MS      6000u   /* pause after BT scan completes            */
-#define WIFI_SCAN_TIMEOUT_MS 15000u  /* abort if scan never completes (bus error guard) */
-#define BT_SCAN_TIMEOUT_MS   12000u  /* abort if BT scan never completes      */
+/* ---- scan timing ---------------------------------------------------------- *
+ * picoOS continuous scanning delivers one window at least every second
+ * (WIFI_WINDOW_MAX_MS / BT_WINDOW_MS), so there are no rescan pauses or scan
+ * timeouts here.  A BT device stays "seen" for a few windows after it was
+ * last heard, so the graph does not show a hole for every missed packet:
+ *   - BLE: devices advertising every 1-2 s regularly miss a 1 s window.
+ *   - Classic: only heard while an inquiry runs, which picoOS starts once
+ *     every BT_INQUIRY_PERIOD_MS, so hold for a whole inquiry period.        */
+#define BT_SEEN_HOLD_BLE      3u
+#define BT_SEEN_HOLD_CLASSIC  (BT_INQUIRY_PERIOD_MS / BT_WINDOW_MS + 1u)
+#define SCAN_RETRY_MS   200u      /* wait before retrying a refused start     */
 
 /* ---- graph geometry ------------------------------------------------------- */
 #define GRAPH_H     100u
@@ -107,17 +113,22 @@ static int    s_graph_head = 0;   /* index of next write position */
 /* ---- Bluetooth result cache ----------------------------------------------- */
 static bt_scan_result_t s_bt_cache[BT_MAX_SCAN_RESULTS];
 static int              s_bt_count = 0;
-/* True if the entry was heard with a valid RSSI during the current scan;
- * false means its cached RSSI is stale.  Guarded by s_bt_lock.              */
+/* True if the entry was heard with a valid RSSI within its hold
+ * (BT_SEEN_HOLD_BLE / _CLASSIC windows); false means its cached RSSI is stale.  s_bt_last_win[] holds the
+ * window number it was last heard in (0 = never).  Guarded by s_bt_lock.    */
 static bool             s_bt_seen[BT_MAX_SCAN_RESULTS];
-/* Set by the worker when a scan finishes; the UI adds one graph column per
- * scan.  Guarded by s_bt_lock.                                              */
+static uint32_t         s_bt_last_win[BT_MAX_SCAN_RESULTS];
+/* Set by the worker when a window has been merged; the UI adds one graph
+ * column per window.  Guarded by s_bt_lock.                                 */
 static bool             s_bt_scan_end = false;
 static int8_t           s_bt_rssi_history[DISP_WIDTH];
 static int              s_bt_graph_head = 0;
 
-/* Returns the number of changes made (new devices added or fields updated). */
-static int merge_bt_into_cache(const bt_scan_result_t *raw, int count)
+/* Merge one scan window (number `win`) into the cache and rebuild
+ * s_bt_seen[].  Returns the number of changes made (new devices added or
+ * fields updated). */
+static int merge_bt_into_cache(const bt_scan_result_t *raw, int count,
+                               uint32_t win)
 {
     int changes = 0;
     for (int i = 0; i < count; i++) {
@@ -134,7 +145,7 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count)
                 s_bt_cache[found].rssi = raw[i].rssi;
                 changes++;
             }
-            if (valid) s_bt_seen[found] = true;
+            if (valid) s_bt_last_win[found] = win;
             if (raw[i].name[0] != '\0' &&
                 strcmp(s_bt_cache[found].name, raw[i].name) != 0) {
                 memcpy(s_bt_cache[found].name, raw[i].name, BT_NAME_LEN);
@@ -161,11 +172,17 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count)
                 changes++;
             }
         } else if (s_bt_count < BT_MAX_SCAN_RESULTS) {
-            s_bt_cache[s_bt_count] = raw[i];
-            s_bt_seen[s_bt_count]  = valid;
+            s_bt_cache[s_bt_count]    = raw[i];
+            s_bt_last_win[s_bt_count] = valid ? win : 0u;
             s_bt_count++;           /* increment after full write */
             changes++;
         }
+    }
+    for (int j = 0; j < s_bt_count; j++) {
+        uint32_t hold = s_bt_cache[j].type == BT_DEVTYPE_CLASSIC
+                            ? BT_SEEN_HOLD_CLASSIC : BT_SEEN_HOLD_BLE;
+        s_bt_seen[j] = s_bt_last_win[j] != 0u &&
+                       win - s_bt_last_win[j] < hold;
     }
     return changes;
 }
@@ -701,6 +718,7 @@ static void enter_screen(ui_state_t *st, screen_t s)
         s_bt_count    = 0;
         s_bt_scan_end = false;
         memset(s_bt_seen, 0, sizeof(s_bt_seen));
+        memset(s_bt_last_win, 0, sizeof(s_bt_last_win));
         kmutex_unlock(&s_bt_lock);
     }
     s_active_screen = s;
@@ -708,6 +726,11 @@ static void enter_screen(ui_state_t *st, screen_t s)
 
 static void back_to_home(ui_state_t *st)
 {
+    /* Stop the radio now rather than when the worker next looks at
+     * s_active_screen: the stop wakes it out of *_scan_wait() at once. */
+    if (st->screen == SCR_WIFI || st->screen == SCR_WIFI_DETAIL) wifi_scan_stop();
+    if (st->screen == SCR_BT   || st->screen == SCR_BT_DETAIL)   bt_scan_stop();
+
     st->screen = SCR_HOME;
     st->sel    = st->prev_sel;
     st->scroll = st->prev_scroll;
@@ -817,86 +840,106 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
     }
 }
 
-/* ---- scan worker (Core 1) ------------------------------------------------- *
- * Manages WiFi and BT scan cycles so the main UI thread stays responsive.
- * Communicates via kmutex-protected caches and flags; s_active_screen is the
- * only lock-free field (single writer, single aligned word).                */
+/* ---- scan worker ---------------------------------------------------------- *
+ * Runs picoOS continuous scanning for the radio the active screen shows and
+ * merges each window into the caches, so the UI thread stays responsive.
+ * The window lists come from *_scan_wait() and are ours until the next wait,
+ * so they are read with no lock; only the merge into the caches takes
+ * s_wifi_lock / s_bt_lock.  s_active_screen is the only lock-free field
+ * (single writer, single aligned word).
+ *
+ * The scan is owned by this process: if netmon is killed, picoOS stops it.  */
 
-/* Snapshots of the kernel scan buffers, filled by the copy-out API.  Static
- * rather than on scan-worker's stack; only scan-worker touches them.        */
-static wifi_scan_result_t s_wifi_raw[WIFI_MAX_SCAN_RESULTS];
-static bt_scan_result_t   s_bt_raw[BT_MAX_SCAN_RESULTS];
+typedef enum { RADIO_NONE = 0, RADIO_WIFI, RADIO_BT } radio_t;
+
+static radio_t screen_radio(screen_t s)
+{
+    switch (s) {
+    case SCR_WIFI: case SCR_WIFI_DETAIL: return RADIO_WIFI;
+    case SCR_BT:   case SCR_BT_DETAIL:   return RADIO_BT;
+    default:                             return RADIO_NONE;
+    }
+}
+
+static void radio_stop(radio_t r)
+{
+    if (r == RADIO_WIFI) wifi_scan_stop();
+    if (r == RADIO_BT)   bt_scan_stop();
+}
+
+/* Start continuous scanning.  False if picoOS refused (another scan is
+ * running, or the BT controller is not up yet); the caller retries. */
+static bool radio_start(radio_t r)
+{
+    if (r == RADIO_WIFI) {
+        kmutex_lock(&s_wifi_lock);
+        s_scanning_wifi = true;
+        kmutex_unlock(&s_wifi_lock);
+        return wifi_scan_start(NULL, NULL) == 0;
+    }
+    kmutex_lock(&s_bt_lock);
+    s_scanning_bt = true;
+    kmutex_unlock(&s_bt_lock);
+    return bt_scan_start(NULL, NULL) == 0;
+}
+
+static void merge_wifi_window(const wifi_scan_list_t *l)
+{
+    int idx[WIFI_MAX_SCAN_RESULTS];
+    int n = build_dedup(l->items, l->count, idx, WIFI_MAX_SCAN_RESULTS);
+
+    kmutex_lock(&s_wifi_lock);
+    merge_into_cache(l->items, idx, n);
+    s_scanning_wifi = false;
+    s_new_wifi_data = true;
+    kmutex_unlock(&s_wifi_lock);
+}
+
+static void merge_bt_window(const bt_scan_list_t *l)
+{
+    kmutex_lock(&s_bt_lock);
+    merge_bt_into_cache(l->items, l->count, l->seq);
+    s_scanning_bt = false;
+    s_new_bt_data = true;
+    s_bt_scan_end = true;
+    kmutex_unlock(&s_bt_lock);
+}
 
 static void scan_worker_entry(void *arg)
 {
     (void)arg;
+    radio_t running = RADIO_NONE;
+
     for (;;) {
-        screen_t scr = s_active_screen;
+        radio_t want = screen_radio(s_active_screen);
 
-        if (scr == SCR_WIFI || scr == SCR_WIFI_DETAIL) {
-            kmutex_lock(&s_wifi_lock);
-            s_scanning_wifi = true;
-            kmutex_unlock(&s_wifi_lock);
-            wifi_scan();
-            uint32_t wifi_elapsed = 0u;
-            while (!wifi_scan_is_done() &&
-                   wifi_elapsed < WIFI_SCAN_TIMEOUT_MS) {
-                sys_sleep(50);
-                wifi_elapsed += 50u;
+        if (want != running) {
+            radio_stop(running);
+            running = RADIO_NONE;
+            if (want == RADIO_NONE) {
+                sys_sleep(100);
+                continue;
             }
-
-            int raw_count = wifi_copy_scan_results(s_wifi_raw,
-                                                   WIFI_MAX_SCAN_RESULTS);
-            const wifi_scan_result_t *raw = s_wifi_raw;
-
-            int tmp_idx[WIFI_MAX_SCAN_RESULTS];
-            int new_ucount = raw_count > 0
-                ? build_dedup(raw, raw_count, tmp_idx, WIFI_MAX_SCAN_RESULTS)
-                : 0;
-
-            kmutex_lock(&s_wifi_lock);
-            merge_into_cache(raw, tmp_idx, new_ucount);
-            s_scanning_wifi = false;
-            s_new_wifi_data = true;
-            kmutex_unlock(&s_wifi_lock);
-            sys_sleep(WIFI_RESCAN_MS);
-
-        } else if (scr == SCR_BT || scr == SCR_BT_DETAIL) {
-            kmutex_lock(&s_bt_lock);
-            s_scanning_bt = true;
-            memset(s_bt_seen, 0, sizeof(s_bt_seen));
-            kmutex_unlock(&s_bt_lock);
-            bt_scan();
-            uint32_t bt_elapsed = 0u;
-            bool     bt_done    = false;
-            /* Merge while the scan runs so the list fills in live.  One
-             * extra pass after it finishes picks up the final readings. */
-            while (!bt_done) {
-                bt_done = bt_scan_is_done() ||
-                          bt_elapsed >= BT_SCAN_TIMEOUT_MS;
-                int raw_count = bt_copy_scan_results(s_bt_raw,
-                                                     BT_MAX_SCAN_RESULTS);
-                if (raw_count > 0) {
-                    kmutex_lock(&s_bt_lock);
-                    if (merge_bt_into_cache(s_bt_raw, raw_count) > 0)
-                        s_new_bt_data = true;
-                    kmutex_unlock(&s_bt_lock);
-                }
-                if (!bt_done) {
-                    sys_sleep(50);
-                    bt_elapsed += 50u;
-                }
+            if (!radio_start(want)) {
+                sys_sleep(SCAN_RETRY_MS);
+                continue;
             }
-            kmutex_lock(&s_bt_lock);
-            s_scanning_bt = false;
-            s_new_bt_data = true;
-            s_bt_scan_end = true;
-            kmutex_unlock(&s_bt_lock);
-            sys_sleep(BT_RESCAN_MS);
-
-        } else {
-            sys_sleep(100);
+            running = want;
         }
+
+        /* Blocks until the next window (at most ~1 s), or returns STOPPED
+         * when back_to_home() stops the radio. */
+        int rc;
+        if (running == RADIO_WIFI) {
+            const wifi_scan_list_t *l;
+            rc = wifi_scan_wait(&l);
+            if (rc == 0) merge_wifi_window(l);
+        } else {
+            const bt_scan_list_t *l;
+            rc = bt_scan_wait(&l);
+            if (rc == 0) merge_bt_window(l);
+        }
+        if (rc != 0) running = RADIO_NONE;   /* stopped: re-evaluate */
     }
 }
 
@@ -917,10 +960,10 @@ void netmon_entry(void *arg)
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_CLEAR, NULL);
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_FLUSH, NULL);
 
-    /* Spawn scan worker to handle WiFi/BT scan cycles in the background,
+    /* Spawn scan worker to receive WiFi/BT scan windows in the background,
      * keeping the UI thread free for input polling and rendering.
-     * Runs AFFINITY_ANY: CYW43 (poll mode) and BTstack route their radio
-     * IRQs through Core 0's NVIC, so radio calls must not be pinned to C1. */
+     * Runs AFFINITY_ANY: CYW43 and BTstack run in the async-context IRQ on
+     * core 0, so radio calls must not be pinned to C1. */
     pcb_t *proc = task_find_process(sys_getpid());
     task_create_thread(proc, "scan-worker",
                        scan_worker_entry, NULL,
@@ -961,7 +1004,7 @@ void netmon_entry(void *arg)
             }
             if (st.screen == SCR_WIFI_DETAIL &&
                 st.detail_idx >= 0 && st.detail_idx < ucount) {
-                /* Not heard this scan: record a gap (0) rather than
+                /* Not heard this window: record a gap (0) rather than
                  * repeating the stale cached reading. */
                 s_rssi_history[s_graph_head] = s_wifi_seen[st.detail_idx]
                     ? (int8_t)s_wifi_cache[st.detail_idx].rssi : 0;
@@ -979,8 +1022,8 @@ void netmon_entry(void *arg)
                     st.sel = bcount > 0 ? bcount - 1 : 0;
                 adjust_scroll(&st, bcount);
             }
-            /* One column per finished scan; a gap (0) if the device was
-             * not heard, rather than repeating the stale cached reading. */
+            /* One column per scan window; a gap (0) if the device was not
+             * heard recently, rather than repeating the stale reading. */
             if (s_bt_scan_end && st.screen == SCR_BT_DETAIL &&
                 st.bt_detail_idx >= 0 && st.bt_detail_idx < bcount) {
                 s_bt_rssi_history[s_bt_graph_head] = s_bt_seen[st.bt_detail_idx]
@@ -995,6 +1038,22 @@ void netmon_entry(void *arg)
         dev_ioctl(DEV_DISPLAY, IOCTL_DISP_GET_BTNS, &btns);
         uint8_t pressed = (uint8_t)(btns & ~prev_btns);  /* rising-edge detect */
         prev_btns = btns;
+#ifdef NETMON_AUTOTEST  /* TEMP: scripted presses, one step per 50 loops (~1 s+) */
+        {
+            static const uint8_t script[] = {
+                0, 0, DISP_BTN_X, 0, 0, 0, 0, 0, 0, 0, 0, 0, DISP_BTN_X, 0, 0, 0, 0, 0,
+                DISP_BTN_Y, 0, 0, 0, 0, DISP_BTN_Y, 0, DISP_BTN_B, DISP_BTN_X, 0, 0, 0,
+                0, 0, 0, 0, 0, DISP_BTN_X, 0, 0, 0, 0, 0, DISP_BTN_Y, 0, 0, DISP_BTN_Y,
+                0, DISP_BTN_A,
+            };
+            static unsigned tick;
+            if (tick % 50u == 0u) {
+                uint8_t k = script[(tick / 50u) % sizeof(script)];
+                if (k) { pressed |= k; printf("[autotest] press %u scr %d\r\n", k, (int)st.screen); }
+            }
+            tick++;
+        }
+#endif
 
         handle_input(&st, pressed);
 
