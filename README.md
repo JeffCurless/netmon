@@ -1,13 +1,13 @@
 # NetMon
 
-A WiFi network monitor for the **Raspberry Pi Pico W** and **Pico 2 W**, built on top of [picoOS](https://github.com/JeffCurless/picoOS) and displayed on a Pimoroni Display Pack 2 (320×240).
+A WiFi and Bluetooth monitor for the **Raspberry Pi Pico W** and **Pico 2 W**, built on top of [picoOS](https://github.com/JeffCurless/picoOS) and displayed on a Pimoroni Display Pack 2 (320×240).
 
-NetMon continuously scans for nearby WiFi networks and presents them on an interactive display — signal strength, channels, security type, and BSSID — with a live RSSI history graph for any selected network.
+NetMon continuously scans for nearby WiFi networks and Bluetooth (Classic and BLE) devices and presents them on an interactive display. WiFi shows signal strength, channels, security type, and BSSID; Bluetooth shows RSSI, device type, class or manufacturer/service, and address. Either detail view includes a live RSSI history graph.
 
 ```
 Home
+├── Bluetooth     — live Classic + BLE scan list with RSSI, detail view per device
 ├── WiFi          — live scan list with RSSI, detail view per network
-├── Bluetooth     — stub (future)
 └── About         — version info and memory stats
 ```
 
@@ -182,15 +182,28 @@ netmon/
 ├── clean                Convenience clean script
 ├── apps/
 │   ├── app_table.c      Defines app_table[] — the shell's `run` command registry
-│   ├── netmon.c         Display UI: screens, WiFi scan loop, rendering
+│   ├── netmon.c         Display UI: screens, rendering, WiFi/BT scan-worker thread
 │   └── netmon.h         Entry point declaration
+├── docs/
+│   └── picoos-scan-buffer-race.md   Open picoOS issue: scan accessors expose live buffers
 └── picoOS/              Git submodule — kernel, shell, drivers, build infrastructure
     └── src/
-        ├── kernel/      task, sched, mem, sync, syscall, fs, vfs, dev, wifi
+        ├── kernel/      task, sched, mem, sync, syscall, fs, vfs, dev, wifi, bluetooth
         ├── shell/       USB CDC interactive shell
         ├── apps/        app_table.h (ABI header) + built-in demo apps
         └── drivers/     ST7789 display, RGB LED
 ```
+
+### Threads
+
+NetMon runs as two threads:
+
+| Thread | Priority | Role |
+|--------|----------|------|
+| `netmon` (main) | 4 | Polls buttons every 20 ms, renders the active screen |
+| `scan-worker` | 5 | Runs WiFi / Bluetooth scan cycles for whichever screen is active and merges results into NetMon's caches |
+
+The caches and their "new data" / "scanning" flags are guarded by two picoOS `kmutex_t` locks (`s_wifi_lock`, `s_bt_lock`). The main thread holds the active screen's lock while it takes in new data, handles input, and renders.
 
 ### How app injection works
 
@@ -209,6 +222,15 @@ Application rules:
 - Never return from the entry function for persistent apps — use `for (;;)`.
 - Use `sys_sleep(ms)` from `kernel/syscall.h`, **not** `sleep_ms()` — the SDK call busy-waits and starves the scheduler.
 - Use priority **4** for normal apps (shell=2, idle=7; lower number = higher priority).
+- Share data between threads with picoOS sync primitives (`kmutex_t`, `ksemaphore_t`, `event_flags_t`, `mqueue_t` from `kernel/sync.h`). Don't use `spinlock_t` in application code: waiters spin instead of blocking, and every `spinlock_init()` permanently claims one of the RP2040's 8 free hardware spinlocks.
+
+---
+
+## Known issues
+
+| Issue | Document |
+|-------|----------|
+| picoOS `wifi_get_scan_results()` / `bt_get_scan_results()` return pointers to live kernel buffers with no locking, so readers can see half-written entries | [docs/picoos-scan-buffer-race.md](docs/picoos-scan-buffer-race.md) |
 
 ---
 

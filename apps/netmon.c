@@ -73,23 +73,31 @@ typedef struct {
     bool     dirty;
 } ui_state_t;
 
-/* ---- cross-thread state (main thread ↔ scan worker on Core 1) ------------ */
-static spinlock_t        s_wifi_lock;        /* guards wifi cache writes     */
-static spinlock_t        s_bt_lock;          /* guards bt cache writes       */
-static volatile bool     s_new_wifi_data  = false;
-static volatile bool     s_new_bt_data    = false;
-static volatile screen_t s_active_screen  = SCR_HOME;
-static volatile bool     s_scanning_wifi  = false;
-static volatile bool     s_scanning_bt    = false;
+/* ---- cross-thread state (main thread ↔ scan worker) ---------------------- *
+ * kmutex_t rather than spinlock_t: the two threads run at different
+ * priorities, so a spinning waiter could starve a preempted holder, and
+ * spinlock_init() permanently claims one of the scarce RP2040 HW spinlocks
+ * on every launch.  kmutex_t blocks the waiter and draws from the kernel's
+ * shared spinlock pool.                                                       */
+static kmutex_t          s_wifi_lock;        /* guards wifi cache + flags    */
+static kmutex_t          s_bt_lock;          /* guards bt cache + flags      */
+static bool              s_new_wifi_data  = false;   /* s_wifi_lock */
+static bool              s_new_bt_data    = false;   /* s_bt_lock   */
+static volatile screen_t s_active_screen  = SCR_HOME; /* main writes, worker reads */
+static bool              s_scanning_wifi  = false;   /* s_wifi_lock */
+static bool              s_scanning_bt    = false;   /* s_bt_lock   */
 
 /* ---- WiFi result cache ---------------------------------------------------- */
 
 static wifi_scan_result_t s_wifi_cache[WIFI_MAX_SCAN_RESULTS];
-static volatile int       s_wifi_ucount = 0;
+static int                s_wifi_ucount = 0;
 
 #define MAX_CHANS_PER_SSID  8u
 static uint8_t s_wifi_chans[WIFI_MAX_SCAN_RESULTS][MAX_CHANS_PER_SSID];
 static int     s_wifi_chan_count[WIFI_MAX_SCAN_RESULTS];
+/* True if the entry was heard in the most recent scan; false means its
+ * cached RSSI is stale.  Guarded by s_wifi_lock.                            */
+static bool    s_wifi_seen[WIFI_MAX_SCAN_RESULTS];
 
 /* RSSI history ring buffer for the detail-panel bar graph.
  * 0 is used as the "no data" sentinel; real RSSI values are always < 0. */
@@ -98,7 +106,13 @@ static int    s_graph_head = 0;   /* index of next write position */
 
 /* ---- Bluetooth result cache ----------------------------------------------- */
 static bt_scan_result_t s_bt_cache[BT_MAX_SCAN_RESULTS];
-static volatile int     s_bt_count = 0;
+static int              s_bt_count = 0;
+/* True if the entry was heard with a valid RSSI during the current scan;
+ * false means its cached RSSI is stale.  Guarded by s_bt_lock.              */
+static bool             s_bt_seen[BT_MAX_SCAN_RESULTS];
+/* Set by the worker when a scan finishes; the UI adds one graph column per
+ * scan.  Guarded by s_bt_lock.                                              */
+static bool             s_bt_scan_end = false;
 static int8_t           s_bt_rssi_history[DISP_WIDTH];
 static int              s_bt_graph_head = 0;
 
@@ -114,11 +128,13 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count)
                 break;
             }
         }
+        bool valid = raw[i].rssi != BT_RSSI_UNKNOWN;
         if (found >= 0) {
-            if (s_bt_cache[found].rssi != raw[i].rssi) {
+            if (valid && s_bt_cache[found].rssi != raw[i].rssi) {
                 s_bt_cache[found].rssi = raw[i].rssi;
                 changes++;
             }
+            if (valid) s_bt_seen[found] = true;
             if (raw[i].name[0] != '\0' &&
                 strcmp(s_bt_cache[found].name, raw[i].name) != 0) {
                 memcpy(s_bt_cache[found].name, raw[i].name, BT_NAME_LEN);
@@ -146,6 +162,7 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count)
             }
         } else if (s_bt_count < BT_MAX_SCAN_RESULTS) {
             s_bt_cache[s_bt_count] = raw[i];
+            s_bt_seen[s_bt_count]  = valid;
             s_bt_count++;           /* increment after full write */
             changes++;
         }
@@ -224,7 +241,7 @@ static const char *auth_label(uint8_t auth_mode)
 
 /*
  * Build a deduplicated index list from raw scan results.
- * Hidden SSIDs (empty name) are skipped.
+ * Hidden SSIDs (empty name) and invalid readings (rssi >= 0) are skipped.
  * When the same SSID appears more than once, the entry with the stronger
  * (higher, i.e. less-negative) RSSI is kept.
  * Returns the number of unique entries written to out_idx[].
@@ -235,6 +252,9 @@ static int build_dedup(const wifi_scan_result_t *results, int count,
     int n = 0;
     for (int i = 0; i < count; i++) {
         if (results[i].ssid[0] == '\0') continue;
+        /* The CYW43 firmware occasionally reports rssi 0 — not a real
+         * reading, and it would beat every genuine one in the max below. */
+        if (results[i].rssi >= 0) continue;
         int dup = -1;
         for (int j = 0; j < n; j++) {
             if (strcmp(results[i].ssid, results[out_idx[j]].ssid) == 0) {
@@ -256,10 +276,12 @@ static int build_dedup(const wifi_scan_result_t *results, int count,
  * Merge a deduplicated scan batch (raw[idx[0..count-1]]) into s_wifi_cache.
  * SSIDs already in the cache get their RSSI/channel updated to the latest
  * reading; new SSIDs are appended (up to WIFI_MAX_SCAN_RESULTS total).
+ * s_wifi_seen[] is rebuilt to mark exactly the entries in this batch.
  */
 static void merge_into_cache(const wifi_scan_result_t *raw,
                               const int *idx, int count)
 {
+    memset(s_wifi_seen, 0, sizeof(s_wifi_seen));
     for (int i = 0; i < count; i++) {
         const wifi_scan_result_t *r = &raw[idx[i]];
         int found = -1;
@@ -273,6 +295,7 @@ static void merge_into_cache(const wifi_scan_result_t *raw,
             /* Update RSSI and auth_mode to latest reading */
             s_wifi_cache[found].rssi      = r->rssi;
             s_wifi_cache[found].auth_mode = r->auth_mode;
+            s_wifi_seen[found]            = true;
             /* Append channel to list if not already present */
             bool ch_seen = false;
             for (int k = 0; k < s_wifi_chan_count[found]; k++) {
@@ -285,6 +308,7 @@ static void merge_into_cache(const wifi_scan_result_t *raw,
             s_wifi_cache[n]       = *r;
             s_wifi_chan_count[n]  = 1;
             s_wifi_chans[n][0]   = r->channel;
+            s_wifi_seen[n]       = true;
             s_wifi_ucount = n + 1;  /* increment after full write */
         }
     }
@@ -647,6 +671,16 @@ static void render_screen(ui_state_t *st)
 
 /* ---- navigation ----------------------------------------------------------- */
 
+/* Lock guarding the scan cache a screen reads, or NULL if it reads none. */
+static kmutex_t *screen_lock(screen_t s)
+{
+    switch (s) {
+    case SCR_WIFI: case SCR_WIFI_DETAIL: return &s_wifi_lock;
+    case SCR_BT:   case SCR_BT_DETAIL:   return &s_bt_lock;
+    default:                             return NULL;
+    }
+}
+
 static void enter_screen(ui_state_t *st, screen_t s)
 {
     st->prev_sel    = st->sel;
@@ -657,14 +691,17 @@ static void enter_screen(ui_state_t *st, screen_t s)
     st->dirty        = true;
 
     if (s == SCR_WIFI) {
-        spinlock_acquire(&s_wifi_lock);
+        kmutex_lock(&s_wifi_lock);
         s_wifi_ucount = 0;
         memset(s_wifi_chan_count, 0, sizeof(s_wifi_chan_count));
-        spinlock_release(&s_wifi_lock);
+        memset(s_wifi_seen, 0, sizeof(s_wifi_seen));
+        kmutex_unlock(&s_wifi_lock);
     } else if (s == SCR_BT) {
-        spinlock_acquire(&s_bt_lock);
-        s_bt_count = 0;
-        spinlock_release(&s_bt_lock);
+        kmutex_lock(&s_bt_lock);
+        s_bt_count    = 0;
+        s_bt_scan_end = false;
+        memset(s_bt_seen, 0, sizeof(s_bt_seen));
+        kmutex_unlock(&s_bt_lock);
     }
     s_active_screen = s;
 }
@@ -782,7 +819,13 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
 
 /* ---- scan worker (Core 1) ------------------------------------------------- *
  * Manages WiFi and BT scan cycles so the main UI thread stays responsive.
- * Communicates via volatile flags and spinlock-protected cache writes.       */
+ * Communicates via kmutex-protected caches and flags; s_active_screen is the
+ * only lock-free field (single writer, single aligned word).                */
+
+/* Snapshots of the kernel scan buffers, filled by the copy-out API.  Static
+ * rather than on scan-worker's stack; only scan-worker touches them.        */
+static wifi_scan_result_t s_wifi_raw[WIFI_MAX_SCAN_RESULTS];
+static bt_scan_result_t   s_bt_raw[BT_MAX_SCAN_RESULTS];
 
 static void scan_worker_entry(void *arg)
 {
@@ -791,7 +834,9 @@ static void scan_worker_entry(void *arg)
         screen_t scr = s_active_screen;
 
         if (scr == SCR_WIFI || scr == SCR_WIFI_DETAIL) {
+            kmutex_lock(&s_wifi_lock);
             s_scanning_wifi = true;
+            kmutex_unlock(&s_wifi_lock);
             wifi_scan();
             uint32_t wifi_elapsed = 0u;
             while (!wifi_scan_is_done() &&
@@ -800,43 +845,53 @@ static void scan_worker_entry(void *arg)
                 wifi_elapsed += 50u;
             }
 
-            const wifi_scan_result_t *raw = NULL;
-            int raw_count = 0;
-            wifi_get_scan_results(&raw, &raw_count);
+            int raw_count = wifi_copy_scan_results(s_wifi_raw,
+                                                   WIFI_MAX_SCAN_RESULTS);
+            const wifi_scan_result_t *raw = s_wifi_raw;
 
-            if (raw_count > 0) {
-                int tmp_idx[WIFI_MAX_SCAN_RESULTS];
-                int new_ucount = build_dedup(raw, raw_count, tmp_idx,
-                                             WIFI_MAX_SCAN_RESULTS);
-                spinlock_acquire(&s_wifi_lock);
-                merge_into_cache(raw, tmp_idx, new_ucount);
-                spinlock_release(&s_wifi_lock);
-            }
+            int tmp_idx[WIFI_MAX_SCAN_RESULTS];
+            int new_ucount = raw_count > 0
+                ? build_dedup(raw, raw_count, tmp_idx, WIFI_MAX_SCAN_RESULTS)
+                : 0;
 
+            kmutex_lock(&s_wifi_lock);
+            merge_into_cache(raw, tmp_idx, new_ucount);
             s_scanning_wifi = false;
             s_new_wifi_data = true;
+            kmutex_unlock(&s_wifi_lock);
             sys_sleep(WIFI_RESCAN_MS);
 
         } else if (scr == SCR_BT || scr == SCR_BT_DETAIL) {
+            kmutex_lock(&s_bt_lock);
             s_scanning_bt = true;
+            memset(s_bt_seen, 0, sizeof(s_bt_seen));
+            kmutex_unlock(&s_bt_lock);
             bt_scan();
             uint32_t bt_elapsed = 0u;
-            while (!bt_scan_is_done() &&
-                   bt_elapsed < BT_SCAN_TIMEOUT_MS) {
-                const bt_scan_result_t *raw = NULL;
-                int raw_count = 0;
-                bt_get_scan_results(&raw, &raw_count);
+            bool     bt_done    = false;
+            /* Merge while the scan runs so the list fills in live.  One
+             * extra pass after it finishes picks up the final readings. */
+            while (!bt_done) {
+                bt_done = bt_scan_is_done() ||
+                          bt_elapsed >= BT_SCAN_TIMEOUT_MS;
+                int raw_count = bt_copy_scan_results(s_bt_raw,
+                                                     BT_MAX_SCAN_RESULTS);
                 if (raw_count > 0) {
-                    spinlock_acquire(&s_bt_lock);
-                    int ch = merge_bt_into_cache(raw, raw_count);
-                    spinlock_release(&s_bt_lock);
-                    if (ch > 0) s_new_bt_data = true;
+                    kmutex_lock(&s_bt_lock);
+                    if (merge_bt_into_cache(s_bt_raw, raw_count) > 0)
+                        s_new_bt_data = true;
+                    kmutex_unlock(&s_bt_lock);
                 }
-                sys_sleep(50);
-                bt_elapsed += 50u;
+                if (!bt_done) {
+                    sys_sleep(50);
+                    bt_elapsed += 50u;
+                }
             }
+            kmutex_lock(&s_bt_lock);
             s_scanning_bt = false;
             s_new_bt_data = true;
+            s_bt_scan_end = true;
+            kmutex_unlock(&s_bt_lock);
             sys_sleep(BT_RESCAN_MS);
 
         } else {
@@ -851,8 +906,8 @@ void netmon_entry(void *arg)
 {
     (void)arg;
 
-    spinlock_init(&s_wifi_lock);
-    spinlock_init(&s_bt_lock);
+    kmutex_init(&s_wifi_lock);
+    kmutex_init(&s_bt_lock);
     s_active_screen = SCR_HOME;
 
     dev_open(DEV_DISPLAY);
@@ -888,6 +943,13 @@ void netmon_entry(void *arg)
     uint8_t prev_btns = 0u;
 
     for (;;) {
+        /* Hold the active screen's cache lock across data intake, input
+         * handling and rendering so the worker cannot merge mid-read.
+         * Captured up front because handle_input() may change st.screen
+         * (enter_screen() takes the target lock itself, from HOME only). */
+        kmutex_t *lk = screen_lock(st.screen);
+        if (lk) kmutex_lock(lk);
+
         if (s_new_wifi_data &&
             (st.screen == SCR_WIFI || st.screen == SCR_WIFI_DETAIL)) {
             s_new_wifi_data = false;
@@ -899,8 +961,10 @@ void netmon_entry(void *arg)
             }
             if (st.screen == SCR_WIFI_DETAIL &&
                 st.detail_idx >= 0 && st.detail_idx < ucount) {
-                s_rssi_history[s_graph_head] =
-                    (int8_t)s_wifi_cache[st.detail_idx].rssi;
+                /* Not heard this scan: record a gap (0) rather than
+                 * repeating the stale cached reading. */
+                s_rssi_history[s_graph_head] = s_wifi_seen[st.detail_idx]
+                    ? (int8_t)s_wifi_cache[st.detail_idx].rssi : 0;
                 s_graph_head = (s_graph_head + 1) % (int)DISP_WIDTH;
             }
             st.dirty = true;
@@ -915,12 +979,15 @@ void netmon_entry(void *arg)
                     st.sel = bcount > 0 ? bcount - 1 : 0;
                 adjust_scroll(&st, bcount);
             }
-            if (st.screen == SCR_BT_DETAIL &&
+            /* One column per finished scan; a gap (0) if the device was
+             * not heard, rather than repeating the stale cached reading. */
+            if (s_bt_scan_end && st.screen == SCR_BT_DETAIL &&
                 st.bt_detail_idx >= 0 && st.bt_detail_idx < bcount) {
-                s_bt_rssi_history[s_bt_graph_head] =
-                    (int8_t)s_bt_cache[st.bt_detail_idx].rssi;
+                s_bt_rssi_history[s_bt_graph_head] = s_bt_seen[st.bt_detail_idx]
+                    ? s_bt_cache[st.bt_detail_idx].rssi : 0;
                 s_bt_graph_head = (s_bt_graph_head + 1) % (int)DISP_WIDTH;
             }
+            s_bt_scan_end = false;
             st.dirty = true;
         }
 
@@ -931,10 +998,21 @@ void netmon_entry(void *arg)
 
         handle_input(&st, pressed);
 
+        /* A HOME → WIFI/BT transition happened without lk; take the new
+         * screen's lock before rendering its cache. */
+        kmutex_t *rlk = screen_lock(st.screen);
+        if (rlk != lk) {
+            if (lk) kmutex_unlock(lk);
+            lk = rlk;
+            if (lk) kmutex_lock(lk);
+        }
+
         if (st.dirty) {
             render_screen(&st);
             st.dirty = false;
         }
+
+        if (lk) kmutex_unlock(lk);
 
         sys_sleep(20);
     }
