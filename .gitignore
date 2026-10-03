@@ -1,2 +1,5 @@
 build_*/
 kits/
+compile_commands.json
+.clangd
+.cache/
