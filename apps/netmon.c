@@ -16,6 +16,7 @@
 #include "kernel/bluetooth.h"
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef NETMON_VERSION
@@ -47,7 +48,7 @@
 #define SCAN_RETRY_MS   200u      /* wait before retrying a refused start     */
 
 /* ---- graph geometry ------------------------------------------------------- */
-#define GRAPH_H     100u
+#define GRAPH_H      56u
 #define GRAPH_Y_BOT ((uint16_t)(DISP_HEIGHT - 1u))
 #define GRAPH_Y_TOP ((uint16_t)(DISP_HEIGHT - GRAPH_H))
 #define GRAPH_GAP_W   8u          /* blank gap starting at the write head — marks current position */
@@ -55,6 +56,7 @@
 /* ---- layout --------------------------------------------------------------- */
 #define TITLE_H      20u
 #define ROW_H        20u
+#define DETAIL_ROW_H 18u          /* tighter rows on detail panels (16 px font) */
 #define SEL_X         4u
 #define TEXT_X       18u
 #define TRI_H        13u
@@ -105,6 +107,8 @@ static int     s_wifi_chan_count[WIFI_MAX_SCAN_RESULTS];
 /* True if the entry was heard in the most recent scan; false means its
  * cached RSSI is stale.  Guarded by s_wifi_lock.                            */
 static bool    s_wifi_seen[WIFI_MAX_SCAN_RESULTS];
+/* BSSIDs sharing the SSID in the most recent scan (mesh / multi-AP). */
+static int     s_wifi_aps[WIFI_MAX_SCAN_RESULTS];
 
 /* RSSI history ring buffer for the detail-panel bar graph.
  * 0 is used as the "no data" sentinel; real RSSI values are always < 0. */
@@ -257,30 +261,36 @@ static const char *rssi_label(int16_t rssi)
     return "Poor";
 }
 
+/* auth_mode is a WIFI_AUTH_* bitmask.  WPA and RSN networks also set the
+ * WEP (privacy) bit, so it means WEP only when neither IE is present.  RSN
+ * does not say whether the AP runs WPA2 or WPA3. */
 static const char *auth_label(uint8_t auth_mode)
 {
-    switch (auth_mode) {
-    case 0: return "Open";
-    case 1: return "WEP-PSK";
-    case 2: return "WPA";
-    case 3: return "WEP-PSK/WPA";
-    case 4: return "WPA3";
-    case 5: return "WEP-PSK/WPA2";
-    case 6: return "WPA2/WPA";
-    case 7: return "WEP-PSK/WPA/WPA2";
-    default: return "Unknown";
-    }
+    bool wpa = auth_mode & WIFI_AUTH_WPA;
+    bool rsn = auth_mode & WIFI_AUTH_RSN;
+    if (wpa && rsn)                  return "WPA/WPA2";
+    if (rsn)                         return "WPA2/WPA3";
+    if (wpa)                         return "WPA";
+    if (auth_mode & WIFI_AUTH_WEP)   return "WEP";
+    return "Open";
+}
+
+/* Center frequency of a 2.4 GHz channel (the CYW43439 has no 5 GHz radio). */
+static int chan_mhz(int ch)
+{
+    return ch == 14 ? 2484 : 2407 + 5 * ch;
 }
 
 /*
  * Build a deduplicated index list from raw scan results.
  * Hidden SSIDs (empty name) and invalid readings (rssi >= 0) are skipped.
  * When the same SSID appears more than once, the entry with the stronger
- * (higher, i.e. less-negative) RSSI is kept.
- * Returns the number of unique entries written to out_idx[].
+ * (higher, i.e. less-negative) RSSI is kept, and out_aps[] counts how many
+ * BSSIDs carried that SSID.
+ * Returns the number of unique entries written to out_idx[] / out_aps[].
  */
 static int build_dedup(const wifi_scan_result_t *results, int count,
-                       int *out_idx, int max_out)
+                       int *out_idx, int *out_aps, int max_out)
 {
     int n = 0;
     for (int i = 0; i < count; i++) {
@@ -296,9 +306,11 @@ static int build_dedup(const wifi_scan_result_t *results, int count,
             }
         }
         if (dup >= 0) {
+            out_aps[dup]++;
             if (results[i].rssi > results[out_idx[dup]].rssi)
                 out_idx[dup] = i;
         } else if (n < max_out) {
+            out_aps[n]   = 1;
             out_idx[n++] = i;
         }
     }
@@ -307,12 +319,13 @@ static int build_dedup(const wifi_scan_result_t *results, int count,
 
 /*
  * Merge a deduplicated scan batch (raw[idx[0..count-1]]) into s_wifi_cache.
- * SSIDs already in the cache get their RSSI/channel updated to the latest
- * reading; new SSIDs are appended (up to WIFI_MAX_SCAN_RESULTS total).
+ * SSIDs already in the cache take the whole latest reading (from the
+ * strongest AP, so BSSID, RSSI and the rest stay consistent) and its channel
+ * is added to the list; new SSIDs are appended (up to WIFI_MAX_SCAN_RESULTS).
  * s_wifi_seen[] is rebuilt to mark exactly the entries in this batch.
  */
 static void merge_into_cache(const wifi_scan_result_t *raw,
-                              const int *idx, int count)
+                              const int *idx, const int *aps, int count)
 {
     memset(s_wifi_seen, 0, sizeof(s_wifi_seen));
     for (int i = 0; i < count; i++) {
@@ -325,10 +338,9 @@ static void merge_into_cache(const wifi_scan_result_t *raw,
             }
         }
         if (found >= 0) {
-            /* Update RSSI and auth_mode to latest reading */
-            s_wifi_cache[found].rssi      = r->rssi;
-            s_wifi_cache[found].auth_mode = r->auth_mode;
-            s_wifi_seen[found]            = true;
+            s_wifi_cache[found] = *r;
+            s_wifi_aps[found]   = aps[i];
+            s_wifi_seen[found]  = true;
             /* Append channel to list if not already present */
             bool ch_seen = false;
             for (int k = 0; k < s_wifi_chan_count[found]; k++) {
@@ -339,6 +351,7 @@ static void merge_into_cache(const wifi_scan_result_t *raw,
         } else if (s_wifi_ucount < WIFI_MAX_SCAN_RESULTS) {
             int n = s_wifi_ucount;
             s_wifi_cache[n]       = *r;
+            s_wifi_aps[n]         = aps[i];
             s_wifi_chan_count[n]  = 1;
             s_wifi_chans[n][0]   = r->channel;
             s_wifi_seen[n]       = true;
@@ -401,7 +414,8 @@ static void draw_selector(int row_in_view)
 
 static void draw_detail_row(int row_in_view, const char *text, uint8_t color)
 {
-    int y = (int)TITLE_H + row_in_view * (int)ROW_H + ((int)ROW_H - 16) / 2;
+    int y = (int)TITLE_H + row_in_view * (int)DETAIL_ROW_H +
+            ((int)DETAIL_ROW_H - 16) / 2;
     disp_text_arg_t t = {
         .x = SEL_X, .y = (uint16_t)y,
         .color = color, .bg = COLOR_PANEL, .scale = 2, ._pad = 0,
@@ -496,10 +510,10 @@ static void render_rssi_graph(const int8_t *history, int head)
         int8_t rv = history[x];
         if (rv == 0) continue;
 
-        /* Map RSSI (-100..-30 dBm) → bar height 0..100 %. */
-        int str = ((int)rv + 100) * 100 / 70;
-        if (str < 1)   str = 1;
-        if (str > 100) str = 100;
+        /* Map RSSI (-100..-30 dBm) → bar height 1..GRAPH_H px. */
+        int str = ((int)rv + 100) * (int)GRAPH_H / 70;
+        if (str < 1)             str = 1;
+        if (str > (int)GRAPH_H)  str = (int)GRAPH_H;
 
         disp_rect_arg_t bar = {
             .x = (uint16_t)x,
@@ -630,33 +644,86 @@ static void render_wifi_detail(ui_state_t *st)
     draw_title(title);
     clear_content();
 
-    /* Row 0: signal strength, colored by RSSI tier */
-    char rssi_line[20];
-    snprintf(rssi_line, sizeof(rssi_line), "RSSI: %ddBm", (int)net->rssi);
-    draw_detail_row(0, rssi_line, rssi_color(net->rssi));
+    /* Rows are emitted in order; ones with no data are skipped. */
+    int  row = 0;
+    char tmp[24];
 
-    /* Row 1: channel list */
-    char chan_str[20] = "Chan: ";
-    int pos = 6;
-    for (int i = 0; i < s_wifi_chan_count[idx]; i++) {
-        int rem = (int)sizeof(chan_str) - pos;
-        if (rem <= 1) break;
-        pos += snprintf(chan_str + pos, (size_t)rem,
-                        i == 0 ? "%d" : ",%d", (int)s_wifi_chans[idx][i]);
+    snprintf(tmp, sizeof(tmp), "RSSI: %ddBm", (int)net->rssi);
+    draw_detail_row(row++, tmp, rssi_color(net->rssi));
+
+    /* RSSI range over the graph history (0 = not heard). */
+    int lo = 0, hi = -128, sum = 0, cnt = 0;
+    for (int i = 0; i < (int)DISP_WIDTH; i++) {
+        int v = s_rssi_history[i];
+        if (v == 0) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        sum += v;
+        cnt++;
     }
-    draw_detail_row(1, chan_str, COLOR_GREY);
+    if (cnt > 0) {
+        snprintf(tmp, sizeof(tmp), "Lo%d Hi%d Av%d", lo, hi, sum / cnt);
+        draw_detail_row(row++, tmp, COLOR_GREY);
+    }
 
-    /* Row 2: security type */
-    char sec_str[24];
-    snprintf(sec_str, sizeof(sec_str), "Sec: %s", auth_label(net->auth_mode));
-    draw_detail_row(2, sec_str, COLOR_GREY);
+    if (net->noise != 0 || net->snr != 0) {
+        snprintf(tmp, sizeof(tmp), "Noise:%d SNR:%ddB",
+                 (int)net->noise, (int)net->snr);
+        draw_detail_row(row++, tmp, COLOR_GREY);
+    }
 
-    /* Row 3: BSSID — fits as one line at scale 2 starting from left margin */
-    char bssid_str[20];
+    /* Channel: frequency when there is one, else the list of channels the
+     * SSID was heard on. */
+    if (s_wifi_chan_count[idx] == 1) {
+        snprintf(tmp, sizeof(tmp), "Chan: %d (%dMHz)",
+                 (int)net->channel, chan_mhz(net->channel));
+    } else {
+        int pos = snprintf(tmp, sizeof(tmp), "Chan: ");
+        for (int i = 0; i < s_wifi_chan_count[idx]; i++) {
+            int rem = 20 - pos;
+            if (rem <= 1) break;
+            pos += snprintf(tmp + pos, (size_t)rem,
+                            i == 0 ? "%d" : ",%d", (int)s_wifi_chans[idx][i]);
+        }
+    }
+    draw_detail_row(row++, tmp, COLOR_GREY);
+
+    if (net->max_rate != 0) {
+        const char *std = (net->phy & WIFI_PHY_HT)   ? "11n" :
+                          (net->phy & WIFI_PHY_OFDM) ? "11g" : "11b";
+        snprintf(tmp, sizeof(tmp), "Mode: %s %s", std,
+                 (net->phy & WIFI_PHY_HT40) ? "40MHz" : "20MHz");
+        draw_detail_row(row++, tmp, COLOR_GREY);
+    }
+
+    if (net->beacon_tu != 0) {
+        /* 1 TU = 1.024 ms; rates are in 500 kb/s units. */
+        snprintf(tmp, sizeof(tmp), "Bcn:%dms Max:%dM",
+                 (int)net->beacon_tu * 1024 / 1000, (int)net->max_rate / 2);
+        draw_detail_row(row++, tmp, COLOR_GREY);
+    }
+
+    snprintf(tmp, sizeof(tmp), "Sec: %s", auth_label(net->auth_mode));
+    draw_detail_row(row++, tmp, COLOR_GREY);
+
+    /* Channel congestion: other networks heard this scan on the same
+     * channel, or within 4 channels (overlapping 20 MHz at 2.4 GHz). */
+    int coch = 0, adj = 0;
+    for (int i = 0; i < s_wifi_ucount; i++) {
+        if (i == idx || !s_wifi_seen[i]) continue;
+        int d = abs((int)s_wifi_cache[i].channel - (int)net->channel);
+        if (d == 0)     coch++;
+        else if (d <= 4) adj++;
+    }
+    snprintf(tmp, sizeof(tmp), "APs:%d CoCh:%d Adj:%d",
+             s_wifi_aps[idx], coch, adj);
+    draw_detail_row(row++, tmp, COLOR_GREY);
+
+    /* BSSID of the strongest AP for this SSID */
     const uint8_t *b = net->bssid;
-    snprintf(bssid_str, sizeof(bssid_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+    snprintf(tmp, sizeof(tmp), "%02X:%02X:%02X:%02X:%02X:%02X",
              b[0], b[1], b[2], b[3], b[4], b[5]);
-    draw_detail_row(3, bssid_str, COLOR_GREY);
+    draw_detail_row(row, tmp, COLOR_GREY);
 
     render_rssi_graph(s_rssi_history, s_graph_head);
 }
@@ -906,10 +973,11 @@ static bool radio_start(radio_t r)
 static void merge_wifi_window(const wifi_scan_list_t *l)
 {
     int idx[WIFI_MAX_SCAN_RESULTS];
-    int n = build_dedup(l->items, l->count, idx, WIFI_MAX_SCAN_RESULTS);
+    int aps[WIFI_MAX_SCAN_RESULTS];
+    int n = build_dedup(l->items, l->count, idx, aps, WIFI_MAX_SCAN_RESULTS);
 
     kmutex_lock(&s_wifi_lock);
-    merge_into_cache(l->items, idx, n);
+    merge_into_cache(l->items, idx, aps, n);
     s_scanning_wifi = false;
     s_new_wifi_data = true;
     kmutex_unlock(&s_wifi_lock);
