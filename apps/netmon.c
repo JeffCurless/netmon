@@ -76,6 +76,7 @@ typedef struct {
     int      bt_sel;        /* BT list cursor saved when entering detail panel */
     int      bt_scroll;
     int      bt_detail_idx; /* s_bt_cache index shown in the BT detail panel */
+    uint8_t  bt_detail_addr[BT_ADDR_LEN]; /* its address, to spot a reused slot */
     bool     dirty;
 } ui_state_t;
 
@@ -176,6 +177,21 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count,
             s_bt_last_win[s_bt_count] = valid ? win : 0u;
             s_bt_count++;           /* increment after full write */
             changes++;
+        } else {
+            /* Full: reuse the slot of the device heard longest ago, as long
+             * as it is no longer seen.  Phones rotate BLE addresses, so
+             * without this stale entries would lock new devices out. */
+            int old = -1;
+            for (int j = 0; j < s_bt_count; j++) {
+                if (s_bt_seen[j] || s_bt_last_win[j] == win) continue;
+                if (old < 0 || s_bt_last_win[j] < s_bt_last_win[old]) old = j;
+            }
+            if (old >= 0) {
+                s_bt_cache[old]    = raw[i];
+                s_bt_last_win[old] = valid ? win : 0u;
+                s_bt_seen[old]     = valid;
+                changes++;
+            }
         }
     }
     for (int j = 0; j < s_bt_count; j++) {
@@ -726,16 +742,19 @@ static void enter_screen(ui_state_t *st, screen_t s)
 
 static void back_to_home(ui_state_t *st)
 {
-    /* Stop the radio now rather than when the worker next looks at
-     * s_active_screen: the stop wakes it out of *_scan_wait() at once. */
-    if (st->screen == SCR_WIFI || st->screen == SCR_WIFI_DETAIL) wifi_scan_stop();
-    if (st->screen == SCR_BT   || st->screen == SCR_BT_DETAIL)   bt_scan_stop();
+    screen_t from = st->screen;
+
+    /* Publish HOME before stopping the radio: the stop wakes the worker
+     * out of *_scan_wait() at once, and it must then see HOME, not the
+     * old screen, or it restarts the scan for another window. */
+    s_active_screen = SCR_HOME;
+    if (from == SCR_WIFI || from == SCR_WIFI_DETAIL) wifi_scan_stop();
+    if (from == SCR_BT   || from == SCR_BT_DETAIL)   bt_scan_stop();
 
     st->screen = SCR_HOME;
     st->sel    = st->prev_sel;
     st->scroll = st->prev_scroll;
     st->dirty  = true;
-    s_active_screen = SCR_HOME;
 }
 
 static void handle_input(ui_state_t *st, uint8_t pressed)
@@ -817,6 +836,7 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
                 st->bt_sel        = st->sel;
                 st->bt_scroll     = st->scroll;
                 st->bt_detail_idx = st->sel;
+                memcpy(st->bt_detail_addr, s_bt_cache[st->sel].addr, BT_ADDR_LEN);
                 st->screen        = SCR_BT_DETAIL;
                 st->dirty         = true;
                 memset(s_bt_rssi_history, 0, sizeof(s_bt_rssi_history));
@@ -1017,6 +1037,16 @@ void netmon_entry(void *arg)
             (st.screen == SCR_BT || st.screen == SCR_BT_DETAIL)) {
             s_new_bt_data = false;
             int bcount = s_bt_count;
+            /* The detail device's slot was reused for another device:
+             * go back to the list rather than show the wrong one. */
+            if (st.screen == SCR_BT_DETAIL &&
+                (st.bt_detail_idx < 0 || st.bt_detail_idx >= bcount ||
+                 memcmp(s_bt_cache[st.bt_detail_idx].addr, st.bt_detail_addr,
+                        BT_ADDR_LEN) != 0)) {
+                st.screen = SCR_BT;
+                st.sel    = st.bt_sel;
+                st.scroll = st.bt_scroll;
+            }
             if (st.screen == SCR_BT) {
                 if (st.sel >= bcount)
                     st.sel = bcount > 0 ? bcount - 1 : 0;

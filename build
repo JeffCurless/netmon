@@ -29,7 +29,7 @@ build_variant() {
     cmake -B "$dir" -DPICO_SDK_PATH="$SDK" -DPICO_BOARD="$board" $flags || return 1
     make -j"$JOBS" -C "$dir"                                            || return 1
     local uf2
-    uf2=$(ls "$dir"/picoOS/src/*.uf2 2>/dev/null | head -1)
+    uf2=$(ls -t "$dir"/picoOS/src/*.uf2 2>/dev/null | head -1)   # newest: old versions linger
     [ -z "$uf2" ] && echo "ERROR: no .uf2 found in $dir/picoOS/src/" >&2 && return 1
     cp -f "$uf2" "kits/netmon-${NETMON_VERSION}.uf2"
 }
