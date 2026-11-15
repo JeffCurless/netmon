@@ -1,10 +1,9 @@
 #!/usr/bin/bash
-# clean — remove all variant build directories
+# clean — remove all variant build directories (everything under builds/)
 
+cd "$(dirname "$0")" || exit 1
 mkdir -p kits
-for board in pico picow pico2 pico2w; do
-    for disp in ND D D2; do
-        dir="build_${board}_${disp}"
-        [ -d "$dir" ] && echo "Cleaning $dir..." && rm -rf "$dir"
-    done
-done
+if [ -d builds ]; then
+    echo "Cleaning builds/..."
+    rm -rf builds
+fi

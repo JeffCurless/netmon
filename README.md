@@ -112,7 +112,7 @@ git submodule update --init
 
 ## Building
 
-The `./build` script compiles the firmware and places the `.uf2` image in `kits/`, named `netmon-<VERSION>.uf2`. The version is read from the `VERSION` file at the repo root — increment it there before a release.
+The `./build` script compiles the firmware and places the `.uf2` image in `kits/`, named `netmon-<board>-<VERSION>.uf2` (`picow` or `pico2w`). The version is read from the `VERSION` file at the repo root — increment it there before a release.
 
 ```bash
 # Build for Pico W with Display Pack 2 (default)
@@ -128,17 +128,17 @@ The `./build` script compiles the firmware and places the `.uf2` image in `kits/
 ./clean
 ```
 
-Build directories follow the pattern `build_<board>_<display>/` (e.g. `build_picow_D2/`).
+Build directories follow the pattern `builds/<board>_<display>/` (e.g. `builds/picow_D2/`).
 
 ### Manual single-variant build
 
 ```bash
-cmake -B build_picow_D2 \
+cmake -B builds/picow_D2 \
       -DPICO_SDK_PATH="$HOME/workspace/pico-sdk" \
       -DPICO_BOARD=picow \
       -DPICOOS_DISPLAY_ENABLE=ON \
       -DPICOOS_DISPLAY_PACK2=ON
-make -j$(nproc) -C build_picow_D2
+make -j$(nproc) -C builds/picow_D2
 ```
 
 ---
@@ -152,7 +152,7 @@ make -j$(nproc) -C build_picow_D2
 3. Copy the firmware:
 
 ```bash
-cp kits/netmon-0.0.3.uf2 /media/$USER/RPI-RP2/
+cp kits/netmon-picow-0.1.8.uf2 /media/$USER/RPI-RP2/
 ```
 
 The Pico reboots into NetMon automatically.
@@ -257,7 +257,7 @@ NetMon builds on picoOS. The following documents in the submodule cover the kern
 With Display Pack 2 enabled on RP2040 (Pico W), approximately **143 KB** of the 264 KB SRAM is available as headroom. Run the picoOS memory report tool after a build:
 
 ```bash
-python3 picoOS/tools/mem_report.py build_picow_D2/picoOS/src/*.elf.map
+python3 picoOS/tools/mem_report.py builds/picow_D2/picoOS/src/*.elf.map
 ```
 
 ---

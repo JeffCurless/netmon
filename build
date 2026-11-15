@@ -10,7 +10,16 @@
 # Set PICO_SDK_PATH if the SDK is not at ~/workspace/pico-sdk.
 
 SDK="${PICO_SDK_PATH:-$HOME/workspace/pico-sdk}"
+
+# The SDK insists on a matching picotool version and finds it through its
+# CMake package config, not PATH. Use a locally built picotool when one is
+# installed (flat install: <dir>/picotool/picotoolConfig.cmake).
+# Override: PICOTOOL_FETCH_FROM_GIT_PATH=/path/to/picotool-install ./build
+if [ -z "$PICOTOOL_FETCH_FROM_GIT_PATH" ] && [ -d "$HOME/workspace/picotool-install/picotool" ]; then
+    export PICOTOOL_FETCH_FROM_GIT_PATH="$HOME/workspace/picotool-install"
+fi
 JOBS="$(nproc)"
+BUILDS="builds"     # every build tree lives under here
 NETMON_VERSION="$(cat "$(dirname "$0")/VERSION" | tr -d '[:space:]')"
 
 case "${1:-pico}" in
@@ -20,24 +29,34 @@ case "${1:-pico}" in
     *)     echo "Usage: $0 [all|pico|pico2]" >&2; exit 1 ;;
 esac
 
-mkdir -p kits
+mkdir -p kits "$BUILDS"
 
 build_variant() {
     local board="$1" disp="$2" flags="$3"
-    local dir="build_${board}_${disp}"
+    local dir="$BUILDS/${board}_${disp}"
     echo "--- ${board} / ${disp} ---"
     cmake -B "$dir" -DPICO_SDK_PATH="$SDK" -DPICO_BOARD="$board" $flags || return 1
     make -j"$JOBS" -C "$dir"                                            || return 1
     local uf2
     uf2=$(ls -t "$dir"/picoOS/src/*.uf2 2>/dev/null | head -1)   # newest: old versions linger
     [ -z "$uf2" ] && echo "ERROR: no .uf2 found in $dir/picoOS/src/" >&2 && return 1
-    cp -f "$uf2" "kits/netmon-${NETMON_VERSION}.uf2"
+    # One image per board: netmon-<board>-<version>.uf2.  If more display
+    # variants are re-enabled below, add ${disp} to the name too.
+    cp -f "$uf2" "kits/netmon-${board}-${NETMON_VERSION}.uf2"
+}
+
+# Stop at the first variant that fails so an older kits/*.uf2 is never
+# mistaken for a fresh build.
+fail() {
+    echo "" >&2
+    echo "BUILD FAILED: $1" >&2
+    exit 1
 }
 
 for board in $BOARDS; do
     #build_variant "$board" ND  "-DPICOOS_DISPLAY_ENABLE=OFF"
     #build_variant "$board" D   "-DPICOOS_DISPLAY_ENABLE=ON  -DPICOOS_DISPLAY_PACK2=OFF"
-    build_variant "$board" D2  "-DPICOOS_DISPLAY_ENABLE=ON  -DPICOOS_DISPLAY_PACK2=ON"
+    build_variant "$board" D2  "-DPICOOS_DISPLAY_ENABLE=ON  -DPICOOS_DISPLAY_PACK2=ON" || fail "$board / D2"
 done
 
 echo ""

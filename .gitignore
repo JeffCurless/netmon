@@ -1,4 +1,4 @@
-build_*/
+builds/
 kits/
 compile_commands.json
 .clangd
