@@ -576,14 +576,6 @@ static uint8_t rssi_color(int16_t rssi)
     return COLOR_RED;
 }
 
-static const char *rssi_label(int16_t rssi)
-{
-    if (rssi > -67) return "Excellent";
-    if (rssi > -70) return "Good";
-    if (rssi > -80) return "Limited";
-    return "Poor";
-}
-
 /* auth_mode is a WIFI_AUTH_* bitmask.  WPA and RSN networks also set the
  * WEP (privacy) bit, so it means WEP only when neither IE is present.  RSN
  * does not say whether the AP runs WPA2 or WPA3. */
@@ -938,7 +930,7 @@ static void render_bt_detail(ui_state_t *st)
     int     n = 0;
 #define LINE(color, ...)                                                    \
     do {                                                                    \
-        if (n < BT_DETAIL_MAX_LINES) {                                      \
+        if (n < (int)BT_DETAIL_MAX_LINES) {                                 \
             snprintf(lines[n], sizeof(lines[n]), __VA_ARGS__);              \
             colors[n++] = (color);                                          \
         }                                                                   \
@@ -1524,9 +1516,16 @@ void netmon_entry(void *arg)
      * Runs AFFINITY_ANY: CYW43 and BTstack run in the async-context IRQ on
      * core 0, so radio calls must not be pinned to C1. */
     pcb_t *proc = task_find_process(sys_getpid());
-    task_create_thread(proc, "scan-worker",
-                       scan_worker_entry, NULL,
-                       5u, DEFAULT_STACK_SIZE);
+    if (task_create_thread(proc, "scan-worker",
+                           scan_worker_entry, NULL,
+                           5u, DEFAULT_STACK_SIZE) == NULL) {
+        /* Thread pool or kernel heap full: without the worker no scan
+         * data ever arrives, so say why instead of showing empty lists. */
+        printf("[netmon] cannot create scan-worker (pool or heap full)\r\n");
+        draw_message("No scan thread");
+        dev_ioctl(DEV_DISPLAY, IOCTL_DISP_FLUSH, NULL);
+        for (;;) sys_sleep(1000);
+    }
 
     ui_state_t st = {
         .screen        = SCR_HOME,

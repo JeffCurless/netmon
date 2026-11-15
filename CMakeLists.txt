@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.18)   # 3.18: TARGET_DIRECTORY below
 
 # ---------------------------------------------------------------------------
 # Board name aliases — mirrors picoOS/CMakeLists.txt.
@@ -55,3 +55,18 @@ string(STRIP "${NETMON_VERSION}" NETMON_VERSION)
 add_compile_definitions(NETMON_VERSION="${NETMON_VERSION}")
 
 add_subdirectory(picoOS/src)
+
+# ---------------------------------------------------------------------------
+# Hold the netmon sources to the picoOS warning set (-Wall -Wextra ... -Werror).
+# TARGET_DIRECTORY picoos is required: the picoos target lives in picoOS/src,
+# and without it this call is silently ignored.
+#
+# -Wno-format-truncation: netmon clips text to fit display rows on purpose
+# (snprintf into fixed 20-byte row buffers), so that warning is all noise.
+# ---------------------------------------------------------------------------
+if(PICOOS_APP_SOURCES)
+    set(NETMON_WARNINGS ${PICOOS_WARNINGS} -Wno-format-truncation)
+    set_source_files_properties(${PICOOS_APP_SOURCES}
+        TARGET_DIRECTORY picoos
+        PROPERTIES COMPILE_OPTIONS "${NETMON_WARNINGS}")
+endif()
