@@ -41,6 +41,8 @@ else()
     set(PICOOS_APP_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/app_table.c
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/netmon.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/apps/oui.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/apps/oui_data.c
     )
     set(PICOOS_APP_INCLUDE_DIRS
         ${CMAKE_CURRENT_SOURCE_DIR}/apps

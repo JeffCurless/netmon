@@ -1,8 +1,13 @@
 /*
  * netmon.c — NetMon display UI application
  *
- * Screens: Home → Bluetooth (live scan) | WiFi (live scan) | About
+ * Screens: Home → WiFi (Scan | Channels) | Bluetooth (Scan | Beacons) |
+ *               Watch | About
  * Buttons: A=up  B=down  X=select  Y=back
+ *   WiFi detail: A watch/unwatch, X per-SSID AP list
+ *   BT detail:   X finder (in the finder, X watch/unwatch)
+ *   Channels:    X bar chart <-> selected channel's history
+ *   Watch:       X remove the selected entry
  */
 
 #include "kernel/syscall.h"
@@ -10,10 +15,13 @@
 #include "kernel/sync.h"
 #include "kernel/dev.h"
 #include "kernel/mem.h"
+#include "kernel/fs.h"
+#include "kernel/vfs.h"
 #include "drivers/display.h"
 #include "netmon.h"
 #include "kernel/wifi.h"
 #include "kernel/bluetooth.h"
+#include "oui.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,14 +74,17 @@
 #define BT_DETAIL_MAX_LINES 28u
 
 /* ---- state ---------------------------------------------------------------- */
-typedef enum { SCR_HOME = 0, SCR_WIFI, SCR_BT, SCR_BT_DETAIL, SCR_ABOUT, SCR_WIFI_DETAIL } screen_t;
+typedef enum { SCR_HOME = 0, SCR_WIFI, SCR_BT, SCR_BT_DETAIL, SCR_ABOUT, SCR_WIFI_DETAIL,
+               SCR_CHANNELS, SCR_WIFI_APS, SCR_BT_FINDER, SCR_WATCH,
+               SCR_WIFI_MENU, SCR_BT_MENU } screen_t;
+
+enum { MENU_HOME = 0, MENU_WIFI, MENU_BT, MENU_COUNT };
 
 typedef struct {
     screen_t screen;
     int      sel;
     int      scroll;
-    int      prev_sel;      /* home cursor saved when entering any sub-screen */
-    int      prev_scroll;
+    int      menu_sel[MENU_COUNT]; /* each menu's cursor, kept while away */
     int      wifi_sel;      /* WiFi list cursor saved when entering detail panel */
     int      wifi_scroll;
     int      detail_idx;    /* s_wifi_cache index shown in the detail panel */
@@ -82,6 +93,8 @@ typedef struct {
     int      bt_detail_idx; /* s_bt_cache index shown in the BT detail panel */
     uint8_t  bt_detail_addr[BT_ADDR_LEN]; /* its address, to spot a reused slot */
     int      detail_scroll; /* first row shown on the BT detail panel */
+    bool     chan_hist;     /* Channels: history graph instead of bars */
+    bool     bt_filter;     /* BT list shows beacons and trackers only */
     bool     dirty;
 } ui_state_t;
 
@@ -112,6 +125,56 @@ static int     s_wifi_chan_count[WIFI_MAX_SCAN_RESULTS];
 static bool    s_wifi_seen[WIFI_MAX_SCAN_RESULTS];
 /* BSSIDs sharing the SSID in the most recent scan (mesh / multi-AP). */
 static int     s_wifi_aps[WIFI_MAX_SCAN_RESULTS];
+/* Window an entry was last heard in; when the cache is full, the entry
+ * heard longest ago (and not within WIFI_EVICT_WINDOWS) makes room. */
+#define WIFI_EVICT_WINDOWS  5u
+static uint32_t s_wifi_last_win[WIFI_MAX_SCAN_RESULTS];
+
+/* Every BSSID of one network (the one open in the detail panel), heard
+ * within AP_HOLD_WINDOWS windows.  s_ap_key names the network; the worker
+ * fills s_ap_list[] from each raw window.  Guarded by s_wifi_lock.          */
+#define MAX_APS          8
+#define AP_HOLD_WINDOWS  3u
+typedef struct {
+    uint8_t  bssid[6];
+    uint8_t  channel;
+    int8_t   rssi;
+    uint32_t last_win;
+} ap_entry_t;
+static wifi_scan_result_t s_ap_key;
+static bool               s_ap_key_set = false;
+static ap_entry_t         s_ap_list[MAX_APS];
+static int                s_ap_count   = 0;
+
+/* The network shown in the WiFi detail / AP panels, to spot its cache slot
+ * being reused for another network.  Main thread only.                      */
+static wifi_scan_result_t s_detail_key;
+
+/* ---- channel survey ------------------------------------------------------- *
+ * Per-channel figures for the Channels screen, one slot per scan window over
+ * the last SURVEY_WINDOWS windows.  Built from the raw window (every BSSID,
+ * hidden SSIDs too), not from the SSID-deduplicated cache, so it counts what
+ * is actually on the air.  Guarded by s_wifi_lock.                           */
+#define SURVEY_CHANS    13        /* 2.4 GHz channels 1..13                 */
+#define SURVEY_WINDOWS   8        /* ~8 s of windows                        */
+#define SURVEY_STRONG  (-70)      /* APs above this count double in load    */
+
+typedef struct {
+    uint8_t aps;        /* BSSIDs heard on the channel                      */
+    uint8_t strong;     /* of those, how many above SURVEY_STRONG           */
+    int8_t  best_rssi;  /* strongest RSSI, 0 = none                         */
+    int8_t  noise;      /* mean firmware noise floor in dBm, 0 = unknown    */
+} chan_win_t;
+
+static chan_win_t s_survey[SURVEY_WINDOWS][SURVEY_CHANS];
+static int        s_survey_head = 0;
+
+/* Channels history view: one column per window for the selected channel.
+ * Load is stored + 1 (0 = no sample); noise in dBm (0 = unknown).  Main
+ * thread only.                                                              */
+static uint8_t s_chan_hist_load[DISP_WIDTH];
+static int8_t  s_chan_hist_noise[DISP_WIDTH];
+static int     s_chan_hist_head = 0;
 
 /* RSSI history ring buffer for the detail-panel bar graph.
  * 0 is used as the "no data" sentinel; real RSSI values are always < 0. */
@@ -453,6 +516,49 @@ static const char *bt_apple_type_str(uint8_t type)
     return NULL;
 }
 
+static bool bt_has_uuid(const bt_scan_result_t *dev, uint16_t uuid)
+{
+    return dev->service_uuid == uuid || dev->svc_data_uuid == uuid;
+}
+
+/* Beacon or tracker kind, from its advertising data, or NULL. */
+static const char *bt_tag(const bt_scan_result_t *dev)
+{
+    const uint8_t *m = dev->mfr_data;
+    if (dev->company_id == 0x004C && dev->mfr_data_len >= 23 &&
+        m[0] == 0x02 && m[1] == 0x15)                  return "iBeacon";
+    if (dev->company_id == 0x004C && dev->mfr_data_len >= 1 &&
+        m[0] == 0x12)                                  return "Find My";
+    if (dev->company_id != BT_COMPANY_NONE && dev->mfr_data_len >= 2 &&
+        m[0] == 0xBE && m[1] == 0xAC)                  return "AltBeacon";
+    if (bt_has_uuid(dev, 0xFEAA))                      return "Eddystone";
+    if (bt_has_uuid(dev, 0xFEED) || bt_has_uuid(dev, 0xFEEC))
+                                                       return "Tile";
+    if (bt_has_uuid(dev, 0xFD5A))                      return "SmartTag";
+    return NULL;
+}
+
+/* OUI vendor of a public address (Classic, or BLE public), else NULL. */
+static const char *bt_vendor(const bt_scan_result_t *dev)
+{
+    bool pub = dev->type == BT_DEVTYPE_CLASSIC ||
+               dev->addr_type == BT_ADDR_PUBLIC;
+    if (!pub) return NULL;
+    const uint8_t *a = dev->addr;   /* LSB first */
+    return oui_vendor(a[5], a[4], a[3]);
+}
+
+/* Best short label for a device: its name, else its beacon kind, else its
+ * vendor. */
+static const char *bt_label(const bt_scan_result_t *dev)
+{
+    if (dev->name[0]) return dev->name;
+    const char *t = bt_tag(dev);
+    if (t) return t;
+    t = bt_vendor(dev);
+    return t ? t : "Unknown";
+}
+
 /* Device type in a Microsoft CDP beacon (Windows "Swift Pair"/CDP). */
 static const char *bt_ms_device_str(uint8_t dev)
 {
@@ -568,6 +674,20 @@ static int bt_distance_dm(int loss_1m)
 /* ---- WiFi helpers --------------------------------------------------------- */
 
 /* Map RSSI to a display color per the signal-quality table. */
+/* Distance estimate in decimetres for a cached device, or -1: from an
+ * iBeacon's measured power at 1 m if it has one, else from TX power at
+ * 0 m (about 41 dB lost in the first metre). */
+static int bt_dist(const bt_scan_result_t *dev)
+{
+    bool ibeacon = dev->company_id == 0x004C && dev->mfr_data_len >= 23 &&
+                   dev->mfr_data[0] == 0x02 && dev->mfr_data[1] == 0x15;
+    if (ibeacon)
+        return bt_distance_dm((int8_t)dev->mfr_data[22] - dev->rssi);
+    if (dev->tx_power != BT_TX_POWER_UNKNOWN)
+        return bt_distance_dm(dev->tx_power - dev->rssi - 41);
+    return -1;
+}
+
 static uint8_t rssi_color(int16_t rssi)
 {
     if (rssi > -67) return COLOR_GREEN;
@@ -590,18 +710,53 @@ static const char *auth_label(uint8_t auth_mode)
     return "Open";
 }
 
+/* Weak security: anything without RSN (WPA2/WPA3) — open, WEP or WPA1. */
+static bool auth_weak(uint8_t auth_mode)
+{
+    return (auth_mode & WIFI_AUTH_RSN) == 0u;
+}
+
+static uint8_t auth_color(uint8_t auth_mode)
+{
+    if (auth_mode & WIFI_AUTH_RSN) return COLOR_GREY;
+    if (auth_mode & WIFI_AUTH_WPA) return COLOR_ORANGE;
+    return COLOR_RED;              /* open or WEP */
+}
+
+/* Vendor of a MAC (first three octets in printed order): the OUI vendor,
+ * "(random)" for a locally administered address, or NULL if unknown. */
+static const char *mac_vendor(uint8_t o0, uint8_t o1, uint8_t o2)
+{
+    if (oui_is_local(o0)) return "(random)";
+    return oui_vendor(o0, o1, o2);
+}
+
 /* Center frequency of a 2.4 GHz channel (the CYW43439 has no 5 GHz radio). */
 static int chan_mhz(int ch)
 {
     return ch == 14 ? 2484 : 2407 + 5 * ch;
 }
 
+/* Two scan results are the same network if they share an SSID; hidden
+ * networks (empty SSID) have no name to share, so each BSSID is its own. */
+static bool same_net(const wifi_scan_result_t *a, const wifi_scan_result_t *b)
+{
+    if (a->ssid[0] == '\0' || b->ssid[0] == '\0')
+        return a->ssid[0] == b->ssid[0] &&
+               memcmp(a->bssid, b->bssid, sizeof(a->bssid)) == 0;
+    return strcmp(a->ssid, b->ssid) == 0;
+}
+
+static const char *wifi_name(const wifi_scan_result_t *net)
+{
+    return net->ssid[0] ? net->ssid : "<hidden>";
+}
+
 /*
  * Build a deduplicated index list from raw scan results.
- * Hidden SSIDs (empty name) and invalid readings (rssi >= 0) are skipped.
- * When the same SSID appears more than once, the entry with the stronger
- * (higher, i.e. less-negative) RSSI is kept, and out_aps[] counts how many
- * BSSIDs carried that SSID.
+ * Invalid readings (rssi >= 0) are skipped.  When the same network (see
+ * same_net) appears more than once, the entry with the stronger RSSI is
+ * kept, and out_aps[] counts how many BSSIDs carried it.
  * Returns the number of unique entries written to out_idx[] / out_aps[].
  */
 static int build_dedup(const wifi_scan_result_t *results, int count,
@@ -609,13 +764,12 @@ static int build_dedup(const wifi_scan_result_t *results, int count,
 {
     int n = 0;
     for (int i = 0; i < count; i++) {
-        if (results[i].ssid[0] == '\0') continue;
         /* The CYW43 firmware occasionally reports rssi 0 — not a real
          * reading, and it would beat every genuine one in the max below. */
         if (results[i].rssi >= 0) continue;
         int dup = -1;
         for (int j = 0; j < n; j++) {
-            if (strcmp(results[i].ssid, results[out_idx[j]].ssid) == 0) {
+            if (same_net(&results[i], &results[out_idx[j]])) {
                 dup = j;
                 break;
             }
@@ -632,47 +786,661 @@ static int build_dedup(const wifi_scan_result_t *results, int count,
     return n;
 }
 
+static void cache_put(int slot, const wifi_scan_result_t *r, int aps,
+                      uint32_t win)
+{
+    s_wifi_cache[slot]      = *r;
+    s_wifi_aps[slot]        = aps;
+    s_wifi_chan_count[slot] = 1;
+    s_wifi_chans[slot][0]   = r->channel;
+    s_wifi_seen[slot]       = true;
+    s_wifi_last_win[slot]   = win;
+}
+
 /*
- * Merge a deduplicated scan batch (raw[idx[0..count-1]]) into s_wifi_cache.
- * SSIDs already in the cache take the whole latest reading (from the
- * strongest AP, so BSSID, RSSI and the rest stay consistent) and its channel
- * is added to the list; new SSIDs are appended (up to WIFI_MAX_SCAN_RESULTS).
- * s_wifi_seen[] is rebuilt to mark exactly the entries in this batch.
+ * Merge a deduplicated scan batch (raw[idx[0..count-1]]) from window `win`
+ * into s_wifi_cache.  Networks already cached take the whole latest reading
+ * (from the strongest AP, so BSSID, RSSI and the rest stay consistent) and
+ * its channel is added to the list.  New networks are appended; when the
+ * cache is full, one replaces the entry heard longest ago, if that was more
+ * than WIFI_EVICT_WINDOWS windows back.  s_wifi_seen[] is rebuilt to mark
+ * exactly the entries in this batch.
  */
 static void merge_into_cache(const wifi_scan_result_t *raw,
-                              const int *idx, const int *aps, int count)
+                             const int *idx, const int *aps, int count,
+                             uint32_t win)
 {
+    bool placed[WIFI_MAX_SCAN_RESULTS] = {false};
     memset(s_wifi_seen, 0, sizeof(s_wifi_seen));
+
+    /* Pass 1: update networks already cached. */
     for (int i = 0; i < count; i++) {
         const wifi_scan_result_t *r = &raw[idx[i]];
-        int found = -1;
         for (int j = 0; j < s_wifi_ucount; j++) {
-            if (strcmp(r->ssid, s_wifi_cache[j].ssid) == 0) {
-                found = j;
-                break;
-            }
-        }
-        if (found >= 0) {
-            s_wifi_cache[found] = *r;
-            s_wifi_aps[found]   = aps[i];
-            s_wifi_seen[found]  = true;
+            if (!same_net(r, &s_wifi_cache[j])) continue;
+            s_wifi_cache[j]    = *r;
+            s_wifi_aps[j]      = aps[i];
+            s_wifi_seen[j]     = true;
+            s_wifi_last_win[j] = win;
             /* Append channel to list if not already present */
             bool ch_seen = false;
-            for (int k = 0; k < s_wifi_chan_count[found]; k++) {
-                if (s_wifi_chans[found][k] == r->channel) { ch_seen = true; break; }
+            for (int k = 0; k < s_wifi_chan_count[j]; k++) {
+                if (s_wifi_chans[j][k] == r->channel) { ch_seen = true; break; }
             }
-            if (!ch_seen && s_wifi_chan_count[found] < (int)MAX_CHANS_PER_SSID)
-                s_wifi_chans[found][s_wifi_chan_count[found]++] = r->channel;
-        } else if (s_wifi_ucount < WIFI_MAX_SCAN_RESULTS) {
-            int n = s_wifi_ucount;
-            s_wifi_cache[n]       = *r;
-            s_wifi_aps[n]         = aps[i];
-            s_wifi_chan_count[n]  = 1;
-            s_wifi_chans[n][0]   = r->channel;
-            s_wifi_seen[n]       = true;
-            s_wifi_ucount = n + 1;  /* increment after full write */
+            if (!ch_seen && s_wifi_chan_count[j] < (int)MAX_CHANS_PER_SSID)
+                s_wifi_chans[j][s_wifi_chan_count[j]++] = r->channel;
+            placed[i] = true;
+            break;
         }
     }
+
+    /* Pass 2: add new ones, evicting stale entries when full. */
+    for (int i = 0; i < count; i++) {
+        if (placed[i]) continue;
+        const wifi_scan_result_t *r = &raw[idx[i]];
+        if (s_wifi_ucount < WIFI_MAX_SCAN_RESULTS) {
+            cache_put(s_wifi_ucount, r, aps[i], win);
+            s_wifi_ucount++;        /* increment after full write */
+            continue;
+        }
+        int old = -1;
+        for (int j = 0; j < s_wifi_ucount; j++) {
+            if (win - s_wifi_last_win[j] <= WIFI_EVICT_WINDOWS) continue;
+            if (old < 0 || s_wifi_last_win[j] < s_wifi_last_win[old]) old = j;
+        }
+        if (old >= 0) cache_put(old, r, aps[i], win);
+    }
+}
+
+/* Track every BSSID of the s_ap_key network from one raw window.  Caller
+ * holds s_wifi_lock. */
+static void ap_track(const wifi_scan_result_t *items, int count, uint32_t win)
+{
+    if (!s_ap_key_set) return;
+    for (int i = 0; i < count; i++) {
+        const wifi_scan_result_t *r = &items[i];
+        if (r->rssi >= 0 || !same_net(r, &s_ap_key)) continue;
+        int slot = -1;
+        for (int j = 0; j < s_ap_count; j++)
+            if (memcmp(s_ap_list[j].bssid, r->bssid, 6) == 0) { slot = j; break; }
+        if (slot < 0) {
+            if (s_ap_count < MAX_APS) {
+                slot = s_ap_count++;
+            } else {
+                slot = 0;
+                for (int j = 1; j < s_ap_count; j++)
+                    if (s_ap_list[j].last_win < s_ap_list[slot].last_win) slot = j;
+            }
+            memcpy(s_ap_list[slot].bssid, r->bssid, 6);
+        }
+        s_ap_list[slot].channel  = r->channel;
+        s_ap_list[slot].rssi     = (int8_t)r->rssi;
+        s_ap_list[slot].last_win = win;
+    }
+    /* Drop APs not heard within the hold. */
+    int n = 0;
+    for (int j = 0; j < s_ap_count; j++)
+        if (win - s_ap_list[j].last_win < AP_HOLD_WINDOWS)
+            s_ap_list[n++] = s_ap_list[j];
+    s_ap_count = n;
+}
+
+/* Record one raw scan window in the survey ring.  Caller holds s_wifi_lock. */
+static void survey_window(const wifi_scan_result_t *items, int count)
+{
+    chan_win_t *w = s_survey[s_survey_head];
+    int nsum[SURVEY_CHANS] = {0};
+    int ncnt[SURVEY_CHANS] = {0};
+
+    memset(w, 0, sizeof(s_survey[0]));
+    for (int i = 0; i < count; i++) {
+        const wifi_scan_result_t *r = &items[i];
+        if (r->rssi >= 0 || r->channel < 1 || r->channel > SURVEY_CHANS)
+            continue;
+        chan_win_t *c = &w[r->channel - 1];
+        c->aps++;
+        if (r->rssi > SURVEY_STRONG) c->strong++;
+        if (c->best_rssi == 0 || r->rssi > c->best_rssi)
+            c->best_rssi = (int8_t)r->rssi;
+        if (r->noise != 0) {
+            nsum[r->channel - 1] += r->noise;
+            ncnt[r->channel - 1]++;
+        }
+    }
+    for (int ch = 0; ch < SURVEY_CHANS; ch++)
+        if (ncnt[ch] > 0) w[ch].noise = (int8_t)(nsum[ch] / ncnt[ch]);
+
+    s_survey_head = (s_survey_head + 1) % SURVEY_WINDOWS;
+}
+
+typedef struct {
+    int aps;        /* most BSSIDs heard in one window                       */
+    int strong;     /* most strong BSSIDs heard in one window                */
+    int best_rssi;  /* strongest RSSI over the ring, 0 = none                */
+    int noise;      /* mean noise floor over the ring, 0 = unknown           */
+} chan_stat_t;
+
+/* Reduce the survey ring to one channel (index 0..SURVEY_CHANS-1). */
+static chan_stat_t survey_chan(int ch)
+{
+    chan_stat_t s = {0, 0, 0, 0};
+    int nsum = 0, ncnt = 0;
+    for (int w = 0; w < SURVEY_WINDOWS; w++) {
+        const chan_win_t *c = &s_survey[w][ch];
+        if (c->aps > s.aps)       s.aps    = c->aps;
+        if (c->strong > s.strong) s.strong = c->strong;
+        if (c->best_rssi != 0 && (s.best_rssi == 0 || c->best_rssi > s.best_rssi))
+            s.best_rssi = c->best_rssi;
+        if (c->noise != 0) { nsum += c->noise; ncnt++; }
+    }
+    if (ncnt > 0) s.noise = nsum / ncnt;
+    return s;
+}
+
+/* Congestion load on a channel: every AP within 4 channels (20 MHz wide at
+ * 5 MHz spacing) adds 5 - distance, doubled for strong APs. */
+static int survey_load(const chan_stat_t *st, int ch)
+{
+    int load = 0;
+    for (int o = 0; o < SURVEY_CHANS; o++) {
+        int d = abs(o - ch);
+        if (d >= 5) continue;
+        load += (5 - d) * (st[o].aps + st[o].strong);
+    }
+    return load;
+}
+
+/* Load on channel `ch` from survey window `w` alone (for the history). */
+static int window_load(int w, int ch)
+{
+    int load = 0;
+    for (int o = 0; o < SURVEY_CHANS; o++) {
+        int d = abs(o - ch);
+        if (d >= 5) continue;
+        load += (5 - d) * (s_survey[w][o].aps + s_survey[w][o].strong);
+    }
+    return load;
+}
+
+/* Add the newest survey window's figures for `ch` to the history. */
+static void chan_hist_push(int ch)
+{
+    int w    = (s_survey_head + SURVEY_WINDOWS - 1) % SURVEY_WINDOWS;
+    int load = window_load(w, ch);
+    s_chan_hist_load[s_chan_hist_head]  = (uint8_t)(load > 254 ? 255 : load + 1);
+    s_chan_hist_noise[s_chan_hist_head] = s_survey[w][ch].noise;
+    s_chan_hist_head = (s_chan_hist_head + 1) % (int)DISP_WIDTH;
+}
+
+static void chan_hist_reset(void)
+{
+    memset(s_chan_hist_load, 0, sizeof(s_chan_hist_load));
+    memset(s_chan_hist_noise, 0, sizeof(s_chan_hist_noise));
+    s_chan_hist_head = 0;
+}
+
+static uint8_t load_color(int load)
+{
+    if (load < 10) return COLOR_GREEN;
+    if (load < 25) return COLOR_YELLOW;
+    if (load < 45) return COLOR_ORANGE;
+    return COLOR_RED;
+}
+
+/* A quiet 2.4 GHz channel reads about -92 dBm; a raised floor means
+ * something (WiFi or not) is putting energy on it. */
+static uint8_t noise_color(int noise)
+{
+    if (noise == 0)   return COLOR_GREY;
+    if (noise >= -75) return COLOR_RED;
+    if (noise >= -82) return COLOR_ORANGE;
+    if (noise >= -88) return COLOR_YELLOW;
+    return COLOR_GREEN;
+}
+
+/* ---- time ----------------------------------------------------------------- */
+
+static uint32_t now_ms(void)
+{
+    uint32_t t = 0u;
+    dev_ioctl(DEV_TIMER, IOCTL_TIMER_GET_TICK, &t);   /* 1 ms scheduler tick */
+    return t;
+}
+
+/* ---- watch list ------------------------------------------------------------ *
+ * Networks and devices to report arriving and leaving.  Kept in WATCH_FILE
+ * so it survives a reboot.  Every scan window, on any screen, the worker
+ * marks each entry of that radio heard or missed; an entry missed for both
+ * WATCH_GONE_MS and its radio's GONE windows has left.  The window counts
+ * matter on the Watch screen, which alternates the radios.
+ * Guarded by s_watch_lock (taken after a cache lock, never before).        */
+#define WATCH_MAX           8
+#define WATCH_EVENTS        6
+#define WATCH_GONE_MS       60000u
+#define WATCH_GONE_WIN_WIFI 10u
+#define WATCH_GONE_WIN_BT   30u
+#define WATCH_FILE          "watch.cfg"
+
+enum { W_UNSEEN = 0, W_HERE, W_GONE };
+
+typedef struct {
+    char     kind;          /* 'W' WiFi by SSID, 'H' hidden WiFi by BSSID,
+                             * 'B' Bluetooth by address                    */
+    uint8_t  state;         /* W_UNSEEN / W_HERE / W_GONE                  */
+    uint16_t missed;        /* windows of its radio since last heard       */
+    uint8_t  mac[6];        /* BSSID ('H') or BT address, LSB first ('B')  */
+    char     name[33];      /* SSID, or the BT label when added            */
+    uint32_t last_ms;
+} watch_t;
+
+typedef struct {
+    char     name[20];
+    bool     arrived;
+    uint32_t ms;
+} watch_event_t;
+
+static kmutex_t      s_watch_lock;
+static watch_t       s_watch[WATCH_MAX];
+static int           s_watch_count = 0;
+static watch_event_t s_watch_ev[WATCH_EVENTS];   /* ring, newest at head-1 */
+static int           s_watch_ev_head = 0;
+static int           s_watch_ev_count = 0;
+/* Bumped by the worker once per event.  Lock-free: a single aligned word
+ * with one writer; main compares it to the last value it handled.        */
+static volatile uint32_t s_watch_seq = 0u;
+static bool          s_watch_dirty = false;   /* main only: needs saving */
+
+static bool watch_match_wifi(const watch_t *w, const wifi_scan_result_t *r)
+{
+    if (w->kind == 'W') return r->ssid[0] && strcmp(w->name, r->ssid) == 0;
+    if (w->kind == 'H') return !r->ssid[0] && memcmp(w->mac, r->bssid, 6) == 0;
+    return false;
+}
+
+/* Index of the entry for a network / device, or -1.  Caller holds the lock. */
+static int watch_find_wifi(const wifi_scan_result_t *net)
+{
+    for (int i = 0; i < s_watch_count; i++)
+        if (watch_match_wifi(&s_watch[i], net)) return i;
+    return -1;
+}
+
+static int watch_find_bt(const uint8_t *addr)
+{
+    for (int i = 0; i < s_watch_count; i++)
+        if (s_watch[i].kind == 'B' && memcmp(s_watch[i].mac, addr, 6) == 0)
+            return i;
+    return -1;
+}
+
+static bool watch_has_wifi(const wifi_scan_result_t *net)
+{
+    kmutex_lock(&s_watch_lock);
+    bool r = watch_find_wifi(net) >= 0;
+    kmutex_unlock(&s_watch_lock);
+    return r;
+}
+
+static bool watch_has_bt(const uint8_t *addr)
+{
+    kmutex_lock(&s_watch_lock);
+    bool r = watch_find_bt(addr) >= 0;
+    kmutex_unlock(&s_watch_lock);
+    return r;
+}
+
+static void watch_remove_locked(int i)
+{
+    for (int j = i; j < s_watch_count - 1; j++) s_watch[j] = s_watch[j + 1];
+    s_watch_count--;
+    s_watch_dirty = true;
+}
+
+static watch_t *watch_add_locked(char kind, const char *name, const uint8_t *mac)
+{
+    if (s_watch_count >= WATCH_MAX) return NULL;
+    watch_t *w = &s_watch[s_watch_count++];
+    memset(w, 0, sizeof(*w));
+    w->kind = kind;
+    strncpy(w->name, name, sizeof(w->name) - 1u);
+    if (mac) memcpy(w->mac, mac, 6);
+    s_watch_dirty = true;
+    return w;
+}
+
+/* Add the network if it is not watched, else remove it.  Main thread. */
+static void watch_toggle_wifi(const wifi_scan_result_t *net)
+{
+    kmutex_lock(&s_watch_lock);
+    int i = watch_find_wifi(net);
+    if (i >= 0)               watch_remove_locked(i);
+    else if (net->ssid[0])    watch_add_locked('W', net->ssid, NULL);
+    else                      watch_add_locked('H', "<hidden>", net->bssid);
+    kmutex_unlock(&s_watch_lock);
+}
+
+static void watch_toggle_bt(const bt_scan_result_t *dev)
+{
+    kmutex_lock(&s_watch_lock);
+    int i = watch_find_bt(dev->addr);
+    if (i >= 0) watch_remove_locked(i);
+    else        watch_add_locked('B', bt_label(dev), dev->addr);
+    kmutex_unlock(&s_watch_lock);
+}
+
+/* Record an arrival or departure.  Caller (the worker) holds the lock. */
+static void watch_event(const watch_t *w, bool arrived, uint32_t now)
+{
+    watch_event_t *e = &s_watch_ev[s_watch_ev_head];
+    strncpy(e->name, w->name, sizeof(e->name) - 1u);
+    e->name[sizeof(e->name) - 1u] = '\0';
+    e->arrived = arrived;
+    e->ms      = now;
+    s_watch_ev_head = (s_watch_ev_head + 1) % WATCH_EVENTS;
+    if (s_watch_ev_count < WATCH_EVENTS) s_watch_ev_count++;
+    s_watch_seq++;
+}
+
+/* One window's verdict for an entry: heard or missed. */
+static void watch_update(watch_t *w, bool heard, uint32_t now, uint32_t gone_win)
+{
+    if (heard) {
+        if (w->state != W_HERE) {
+            w->state = W_HERE;
+            watch_event(w, true, now);
+        }
+        w->missed  = 0;
+        w->last_ms = now;
+        return;
+    }
+    if (w->missed < 0xFFFFu) w->missed++;
+    if (w->state == W_HERE && w->missed >= gone_win &&
+        now - w->last_ms >= WATCH_GONE_MS) {
+        w->state = W_GONE;
+        watch_event(w, false, now);
+    }
+}
+
+static void watch_wifi_window(const wifi_scan_result_t *items, int count)
+{
+    uint32_t now = now_ms();
+    kmutex_lock(&s_watch_lock);
+    for (int i = 0; i < s_watch_count; i++) {
+        watch_t *w = &s_watch[i];
+        if (w->kind == 'B') continue;
+        bool heard = false;
+        for (int k = 0; k < count && !heard; k++)
+            heard = items[k].rssi < 0 && watch_match_wifi(w, &items[k]);
+        watch_update(w, heard, now, WATCH_GONE_WIN_WIFI);
+    }
+    kmutex_unlock(&s_watch_lock);
+}
+
+static void watch_bt_window(const bt_scan_result_t *items, int count)
+{
+    uint32_t now = now_ms();
+    kmutex_lock(&s_watch_lock);
+    for (int i = 0; i < s_watch_count; i++) {
+        watch_t *w = &s_watch[i];
+        if (w->kind != 'B') continue;
+        bool heard = false;
+        for (int k = 0; k < count && !heard; k++)
+            heard = memcmp(items[k].addr, w->mac, 6) == 0;
+        watch_update(w, heard, now, WATCH_GONE_WIN_BT);
+    }
+    kmutex_unlock(&s_watch_lock);
+}
+
+/* File format, one entry per line: <kind> <12 hex digits> <name>.  The
+ * address is in stored order (BT: LSB first). */
+static char s_file_buf[512];   /* watch file I/O; main thread only */
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static void watch_load(void)
+{
+    int fd = fs_open(WATCH_FILE, VFS_O_RDONLY);
+    if (fd < 0) return;
+    int n = fs_read(fd, (uint8_t *)s_file_buf, sizeof(s_file_buf) - 1u);
+    fs_close(fd);
+    if (n <= 0) return;
+    s_file_buf[n] = '\0';
+
+    kmutex_lock(&s_watch_lock);
+    char *p = s_file_buf;
+    while (*p) {
+        char *eol = strchr(p, '\n');
+        if (eol) *eol = '\0';
+        char kind = p[0];
+        if ((kind == 'W' || kind == 'H' || kind == 'B') && strlen(p) >= 15 &&
+            p[1] == ' ' && p[14] == ' ') {
+            uint8_t mac[6];
+            bool ok = true;
+            for (int i = 0; i < 6 && ok; i++) {
+                int hi = hexval(p[2 + 2 * i]), lo = hexval(p[3 + 2 * i]);
+                ok = hi >= 0 && lo >= 0;
+                mac[i] = (uint8_t)(hi << 4 | lo);
+            }
+            if (ok) watch_add_locked(kind, p + 15, mac);
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    s_watch_dirty = false;
+    kmutex_unlock(&s_watch_lock);
+}
+
+/* Write the list to flash.  False if the file system refused (busy). */
+static bool watch_save(void)
+{
+    int len = 0;
+    kmutex_lock(&s_watch_lock);
+    for (int i = 0; i < s_watch_count; i++) {
+        const watch_t *w = &s_watch[i];
+        const uint8_t *m = w->mac;
+        len += snprintf(s_file_buf + len, sizeof(s_file_buf) - (size_t)len,
+                        "%c %02X%02X%02X%02X%02X%02X %s\n", w->kind,
+                        m[0], m[1], m[2], m[3], m[4], m[5], w->name);
+        if (len >= (int)sizeof(s_file_buf)) { len = (int)sizeof(s_file_buf) - 1; break; }
+    }
+    kmutex_unlock(&s_watch_lock);
+
+    if (len == 0) {
+        fs_delete(WATCH_FILE);
+        return true;
+    }
+    int fd = fs_open(WATCH_FILE, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    if (fd < 0) return false;
+    fs_write(fd, (const uint8_t *)s_file_buf, (uint32_t)len);
+    fs_close(fd);
+    return true;
+}
+
+/* ---- survey log ------------------------------------------------------------ *
+ * Every network and device heard this session, kept in RAM by the worker
+ * and written to LOG_WIFI_FILE / LOG_BT_FILE as CSV every LOG_SAVE_MS and
+ * on leaving a scanning screen, so `cat wifi.csv` in the shell shows the
+ * last session even after a reboot.  When a table is full, the entry heard
+ * longest ago makes room.  Times are seconds since boot.  Guarded by
+ * s_log_lock (never held with another lock).                               */
+#define LOG_MAX_WIFI   24
+#define LOG_MAX_BT     24
+#define LOG_SAVE_MS    300000u
+#define LOG_WIFI_FILE  "wifi.csv"
+#define LOG_BT_FILE    "bt.csv"
+
+typedef struct {
+    uint8_t  bssid[6];
+    char     ssid[25];
+    uint8_t  channel;
+    uint8_t  auth;
+    int8_t   best;
+    uint32_t first_s, last_s;
+} wlog_t;
+
+typedef struct {
+    uint8_t     addr[6];      /* LSB first */
+    char        name[21];
+    uint8_t     type;
+    int8_t      best;         /* BT_RSSI_UNKNOWN until a valid reading */
+    const char *tag;          /* bt_tag() once seen, else NULL */
+    uint32_t    first_s, last_s;
+} blog_t;
+
+static kmutex_t s_log_lock;
+static wlog_t   s_wlog[LOG_MAX_WIFI];
+static blog_t   s_blog[LOG_MAX_BT];
+static int      s_wlog_n = 0, s_blog_n = 0;
+static bool     s_log_dirty = false;
+
+static void log_wifi_window(const wifi_scan_result_t *items, int count)
+{
+    uint32_t now = now_ms() / 1000u;
+    kmutex_lock(&s_log_lock);
+    for (int i = 0; i < count; i++) {
+        const wifi_scan_result_t *r = &items[i];
+        if (r->rssi >= 0) continue;
+        int slot = -1;
+        for (int j = 0; j < s_wlog_n; j++)
+            if (memcmp(s_wlog[j].bssid, r->bssid, 6) == 0) { slot = j; break; }
+        if (slot < 0) {
+            if (s_wlog_n < LOG_MAX_WIFI) {
+                slot = s_wlog_n++;
+            } else {
+                slot = 0;
+                for (int j = 1; j < s_wlog_n; j++)
+                    if (s_wlog[j].last_s < s_wlog[slot].last_s) slot = j;
+            }
+            memset(&s_wlog[slot], 0, sizeof(s_wlog[slot]));
+            memcpy(s_wlog[slot].bssid, r->bssid, 6);
+            s_wlog[slot].best    = (int8_t)r->rssi;
+            s_wlog[slot].first_s = now;
+        }
+        wlog_t *e = &s_wlog[slot];
+        strncpy(e->ssid, r->ssid, sizeof(e->ssid) - 1u);
+        e->channel = r->channel;
+        e->auth    = r->auth_mode;
+        if (r->rssi > e->best) e->best = (int8_t)r->rssi;
+        e->last_s  = now;
+    }
+    if (count > 0) s_log_dirty = true;
+    kmutex_unlock(&s_log_lock);
+}
+
+static void log_bt_window(const bt_scan_result_t *items, int count)
+{
+    uint32_t now = now_ms() / 1000u;
+    kmutex_lock(&s_log_lock);
+    for (int i = 0; i < count; i++) {
+        const bt_scan_result_t *r = &items[i];
+        int slot = -1;
+        for (int j = 0; j < s_blog_n; j++)
+            if (memcmp(s_blog[j].addr, r->addr, 6) == 0) { slot = j; break; }
+        if (slot < 0) {
+            if (s_blog_n < LOG_MAX_BT) {
+                slot = s_blog_n++;
+            } else {
+                slot = 0;
+                for (int j = 1; j < s_blog_n; j++)
+                    if (s_blog[j].last_s < s_blog[slot].last_s) slot = j;
+            }
+            memset(&s_blog[slot], 0, sizeof(s_blog[slot]));
+            memcpy(s_blog[slot].addr, r->addr, 6);
+            s_blog[slot].best    = BT_RSSI_UNKNOWN;
+            s_blog[slot].first_s = now;
+        }
+        blog_t *e = &s_blog[slot];
+        if (r->name[0]) strncpy(e->name, r->name, sizeof(e->name) - 1u);
+        e->type = (uint8_t)r->type;
+        if (r->rssi != BT_RSSI_UNKNOWN &&
+            (e->best == BT_RSSI_UNKNOWN || r->rssi > e->best))
+            e->best = r->rssi;
+        const char *t = bt_tag(r);
+        if (t) e->tag = t;
+        e->last_s = now;
+    }
+    if (count > 0) s_log_dirty = true;
+    kmutex_unlock(&s_log_lock);
+}
+
+/* CSV fields: drop commas and quotes from names rather than escape them. */
+static void csv_clean(char *dst, const char *src, size_t len)
+{
+    size_t n = 0;
+    for (; *src && n + 1 < len; src++)
+        if (*src != ',' && *src != '"' && *src >= ' ') dst[n++] = *src;
+    dst[n] = '\0';
+}
+
+static bool log_write_wifi(void)
+{
+    static char line[112];
+    int fd = fs_open(LOG_WIFI_FILE, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    if (fd < 0) return false;
+    static const char hdr[] = "bssid,ssid,ch,security,best_dbm,vendor,first_s,last_s\n";
+    fs_write(fd, (const uint8_t *)hdr, sizeof(hdr) - 1u);
+    for (int i = 0; i < s_wlog_n; i++) {
+        const wlog_t *e = &s_wlog[i];
+        const uint8_t *b = e->bssid;
+        char ssid[25];
+        csv_clean(ssid, e->ssid, sizeof(ssid));
+        const char *v = mac_vendor(b[0], b[1], b[2]);
+        int n = snprintf(line, sizeof(line),
+                         "%02X:%02X:%02X:%02X:%02X:%02X,%s,%u,%s,%d,%s,%lu,%lu\n",
+                         b[0], b[1], b[2], b[3], b[4], b[5], ssid,
+                         (unsigned)e->channel, auth_label(e->auth), (int)e->best,
+                         v ? v : "", (unsigned long)e->first_s,
+                         (unsigned long)e->last_s);
+        if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+        fs_write(fd, (const uint8_t *)line, (uint32_t)n);
+    }
+    fs_close(fd);
+    return true;
+}
+
+static bool log_write_bt(void)
+{
+    static char line[112];
+    int fd = fs_open(LOG_BT_FILE, VFS_O_WRONLY | VFS_O_CREAT | VFS_O_TRUNC);
+    if (fd < 0) return false;
+    static const char hdr[] = "addr,name,type,best_dbm,kind,first_s,last_s\n";
+    fs_write(fd, (const uint8_t *)hdr, sizeof(hdr) - 1u);
+    for (int i = 0; i < s_blog_n; i++) {
+        const blog_t *e = &s_blog[i];
+        const uint8_t *a = e->addr;
+        char name[21];
+        csv_clean(name, e->name, sizeof(name));
+        int n = snprintf(line, sizeof(line),
+                         "%02X:%02X:%02X:%02X:%02X:%02X,%s,%s,%d,%s,%lu,%lu\n",
+                         a[5], a[4], a[3], a[2], a[1], a[0], name,
+                         e->type == BT_DEVTYPE_BLE ? "BLE" : "Classic",
+                         e->best == BT_RSSI_UNKNOWN ? 0 : (int)e->best,
+                         e->tag ? e->tag : "", (unsigned long)e->first_s,
+                         (unsigned long)e->last_s);
+        if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+        fs_write(fd, (const uint8_t *)line, (uint32_t)n);
+    }
+    fs_close(fd);
+    return true;
+}
+
+/* Write both logs if anything changed.  Main thread. */
+static void log_save(void)
+{
+    kmutex_lock(&s_log_lock);
+    if (s_log_dirty) {
+        bool ok = true;
+        if (s_wlog_n > 0) ok = log_write_wifi() && ok;
+        if (s_blog_n > 0) ok = log_write_bt() && ok;
+        if (ok) s_log_dirty = false;
+    }
+    kmutex_unlock(&s_log_lock);
 }
 
 /* ---- drawing helpers ------------------------------------------------------ */
@@ -776,17 +1544,73 @@ static void adjust_scroll(ui_state_t *st, int count)
 
 /* ---- screen renderers ----------------------------------------------------- */
 
-static void render_home(ui_state_t *st)
-{
-    static const char *items[] = {"Bluetooth", "WiFi", "About"};
-    enum { HOME_COUNT = 3 };
+/* ---- menus ---------------------------------------------------------------- *
+ * Home and the WiFi / Bluetooth submenus.  An item opens a screen; for the
+ * BT list, bt_filter picks all devices or only beacons and trackers.        */
+typedef struct {
+    const char *label;
+    screen_t    target;
+    bool        bt_filter;
+} menu_item_t;
 
-    draw_title("NetMon V" NETMON_VERSION);
+typedef struct {
+    const char        *title;
+    const menu_item_t *items;
+    int                count;
+} menu_t;
+
+static const menu_item_t s_home_items[] = {
+    { "WiFi",      SCR_WIFI_MENU, false },
+    { "Bluetooth", SCR_BT_MENU,   false },
+    { "Watch",     SCR_WATCH,     false },
+    { "About",     SCR_ABOUT,     false },
+};
+static const menu_item_t s_wifi_items[] = {
+    { "Scan",      SCR_WIFI,      false },
+    { "Channels",  SCR_CHANNELS,  false },
+};
+static const menu_item_t s_bt_items[] = {
+    { "Scan",      SCR_BT,        false },
+    { "Beacons",   SCR_BT,        true  },
+};
+#define ITEMS(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
+static const menu_t s_menus[MENU_COUNT] = {
+    [MENU_HOME] = { "NetMon V" NETMON_VERSION, ITEMS(s_home_items) },
+    [MENU_WIFI] = { "WiFi",                    ITEMS(s_wifi_items) },
+    [MENU_BT]   = { "Bluetooth",               ITEMS(s_bt_items)   },
+};
+#undef ITEMS
+
+/* Menu shown by a screen, or -1 if it is not a menu. */
+static int screen_menu(screen_t s)
+{
+    switch (s) {
+    case SCR_HOME:      return MENU_HOME;
+    case SCR_WIFI_MENU: return MENU_WIFI;
+    case SCR_BT_MENU:   return MENU_BT;
+    default:            return -1;
+    }
+}
+
+/* Where Y goes from a screen (detail panels handle Y themselves). */
+static screen_t screen_parent(screen_t s)
+{
+    switch (s) {
+    case SCR_WIFI: case SCR_CHANNELS: return SCR_WIFI_MENU;
+    case SCR_BT:                      return SCR_BT_MENU;
+    default:                          return SCR_HOME;
+    }
+}
+
+static void render_menu(ui_state_t *st)
+{
+    const menu_t *m = &s_menus[screen_menu(st->screen)];
+    draw_title(m->title);
     clear_content();
-    for (int i = 0; i < HOME_COUNT; i++) {
+    for (int i = 0; i < m->count; i++) {
         int view = i - st->scroll;
         if (view < 0 || view >= (int)VISIBLE_ROWS) continue;
-        draw_row(view, items[i], COLOR_GREY, i == st->sel);
+        draw_row(view, m->items[i].label, COLOR_GREY, i == st->sel);
     }
 }
 
@@ -805,7 +1629,9 @@ static void render_wifi(ui_state_t *st)
         if (view < 0 || view >= (int)VISIBLE_ROWS) continue;
         const wifi_scan_result_t *net = &s_wifi_cache[i];
         char line[20];
-        snprintf(line, sizeof(line), "%-11.11s %4d", net->ssid, (int)net->rssi);
+        /* '!' between name and RSSI flags weak security (no WPA2/WPA3). */
+        snprintf(line, sizeof(line), "%-11.11s%c%4d", wifi_name(net),
+                 auth_weak(net->auth_mode) ? '!' : ' ', (int)net->rssi);
         draw_row(view, line, rssi_color(net->rssi), i == st->sel);
     }
 }
@@ -884,25 +1710,129 @@ static void draw_scroll_marks(bool up, bool down)
     }
 }
 
+/* Cache indices the BT list shows (all, or beacons and trackers only).
+ * Returns how many were written to map[] (BT_MAX_SCAN_RESULTS long). */
+static int bt_view(const ui_state_t *st, int *map)
+{
+    int n = 0;
+    for (int i = 0; i < s_bt_count; i++)
+        if (!st->bt_filter || bt_tag(&s_bt_cache[i]))
+            map[n++] = i;
+    return n;
+}
+
 static void render_bt(ui_state_t *st)
 {
-    draw_title("Bluetooth Devices");
+    draw_title(st->bt_filter ? "Beacons & Tags" : "Bluetooth Devices");
     clear_content();
 
-    if (s_bt_count == 0) {
-        draw_message(s_scanning_bt ? "Scanning..." : "No devices found");
+    int map[BT_MAX_SCAN_RESULTS];
+    int n = bt_view(st, map);
+    if (n == 0) {
+        draw_message(s_scanning_bt ? "Scanning..." :
+                     st->bt_filter ? "None found" : "No devices found");
         return;
     }
 
-    for (int i = 0; i < s_bt_count; i++) {
+    for (int i = 0; i < n; i++) {
         int view = i - st->scroll;
         if (view < 0 || view >= (int)VISIBLE_ROWS) continue;
-        const bt_scan_result_t *dev = &s_bt_cache[i];
-        const char *nm = dev->name[0] ? dev->name : "Unknown";
+        const bt_scan_result_t *dev = &s_bt_cache[map[i]];
+        /* Beacons: the kind first; a beacon rarely has a name. */
+        const char *nm = st->bt_filter ? bt_tag(dev) : bt_label(dev);
         char line[20];
         snprintf(line, sizeof(line), "%-11.11s %4d", nm, (int)dev->rssi);
         draw_row(view, line, rssi_color(dev->rssi), i == st->sel);
     }
+}
+
+/* Warmer / colder: the newest three readings against the three before. */
+static const char *bt_trend(void)
+{
+    int v[6], n = 0;
+    for (int k = 1; k <= (int)DISP_WIDTH && n < 6; k++) {
+        int x = (s_bt_graph_head - k + (int)DISP_WIDTH) % (int)DISP_WIDTH;
+        if (s_bt_rssi_history[x] != 0) v[n++] = s_bt_rssi_history[x];
+    }
+    if (n < 6) return "";
+    int d = (v[0] + v[1] + v[2]) - (v[3] + v[4] + v[5]);
+    if (d >= 9)  return "Warmer";
+    if (d <= -9) return "Colder";
+    return "Steady";
+}
+
+#ifdef PICOOS_LED_ENABLE
+static uint32_t s_finder_rgb = 0u;     /* LED color the finder wants; main */
+#endif
+
+/* Finder: one device, big RSSI, a meter and a trend, to walk towards it.
+ * The LED follows the signal (green near, red far, off when lost). */
+static void render_bt_finder(ui_state_t *st)
+{
+    int idx = st->bt_detail_idx;
+    if (idx < 0 || idx >= s_bt_count) {
+        draw_title("Finder");
+        clear_content();
+        draw_message("No data");
+        return;
+    }
+    const bt_scan_result_t *dev = &s_bt_cache[idx];
+    bool seen = s_bt_seen[idx];
+
+    char tmp[20];
+    snprintf(tmp, sizeof(tmp), "%s%.17s", watch_has_bt(dev->addr) ? "*" : "",
+             bt_label(dev));
+    draw_title(tmp);
+    clear_content();
+
+    uint8_t col = seen ? rssi_color(dev->rssi) : COLOR_GREY;
+    if (seen) snprintf(tmp, sizeof(tmp), "%d", (int)dev->rssi);
+    else      snprintf(tmp, sizeof(tmp), "Lost");
+    int tw = (int)strlen(tmp) * 32;
+    disp_text_arg_t big = {
+        .x = (uint16_t)(((int)DISP_WIDTH - tw) / 2), .y = TITLE_H + 4,
+        .color = col, .bg = COLOR_PANEL, .scale = 4, ._pad = 0, .str = tmp
+    };
+    dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_TEXT, &big);
+
+    /* Meter: -100 dBm empty, -30 dBm full. */
+    int mx = 4, my = (int)TITLE_H + 40, mw = (int)DISP_WIDTH - 8, mh = 10;
+    disp_rect_arg_t frame = {
+        .x = (uint16_t)mx, .y = (uint16_t)my, .w = (uint16_t)mw, .h = (uint16_t)mh,
+        .color = COLOR_GREY, .filled = 0, ._pad1 = 0, ._pad2 = 0
+    };
+    dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &frame);
+    if (seen) {
+        int fill = ((int)dev->rssi + 100) * (mw - 2) / 70;
+        if (fill < 1)      fill = 1;
+        if (fill > mw - 2) fill = mw - 2;
+        disp_rect_arg_t bar = {
+            .x = (uint16_t)(mx + 1), .y = (uint16_t)(my + 1),
+            .w = (uint16_t)fill, .h = (uint16_t)(mh - 2),
+            .color = col, .filled = 1, ._pad1 = 0, ._pad2 = 0
+        };
+        dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &bar);
+    }
+
+    int dm = seen ? bt_dist(dev) : -1;
+    if (dm >= 0) snprintf(tmp, sizeof(tmp), "%-6s ~%d.%dm", bt_trend(), dm / 10, dm % 10);
+    else         snprintf(tmp, sizeof(tmp), "%s", seen ? bt_trend() : "");
+    disp_text_arg_t tr = {
+        .x = SEL_X, .y = TITLE_H + 54,
+        .color = COLOR_GREY, .bg = COLOR_PANEL, .scale = 2, ._pad = 0, .str = tmp
+    };
+    dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_TEXT, &tr);
+
+    /* The history graph only fits under the text on the larger panel. */
+    if ((int)TITLE_H + 74 <= (int)GRAPH_Y_TOP)
+        render_rssi_graph(s_bt_rssi_history, s_bt_graph_head);
+
+#ifdef PICOOS_LED_ENABLE
+    s_finder_rgb = !seen               ? 0x000000u :
+                   dev->rssi > -67     ? 0x00FF00u :
+                   dev->rssi > -70     ? 0xFFFF00u :
+                   dev->rssi > -80     ? 0xFF6000u : 0xFF0000u;
+#endif
 }
 
 static void render_bt_detail(ui_state_t *st)
@@ -918,7 +1848,7 @@ static void render_bt_detail(ui_state_t *st)
     const bt_scan_result_t *dev = &s_bt_cache[idx];
 
     char title[20];
-    snprintf(title, sizeof(title), "%.18s", dev->name[0] ? dev->name : "BT Device");
+    snprintf(title, sizeof(title), "%.18s", bt_label(dev));
     draw_title(title);
     clear_content();
 
@@ -944,15 +1874,9 @@ static void render_bt_detail(ui_state_t *st)
     if (rssi_range(s_bt_rssi_history, range, sizeof range))
         LINE(COLOR_GREY, "%s", range);
 
-    /* Distance: from the iBeacon's measured power at 1 m if it has one,
-     * else from TX power at 0 m (about 41 dB lost in the first metre). */
     bool ibeacon = dev->company_id == 0x004C && dev->mfr_data_len >= 23 &&
                    dev->mfr_data[0] == 0x02 && dev->mfr_data[1] == 0x15;
-    int dm = -1;
-    if (s_bt_seen[idx] && ibeacon)
-        dm = bt_distance_dm((int8_t)dev->mfr_data[22] - dev->rssi);
-    else if (s_bt_seen[idx] && dev->tx_power != BT_TX_POWER_UNKNOWN)
-        dm = bt_distance_dm(dev->tx_power - dev->rssi - 41);
+    int dm = s_bt_seen[idx] ? bt_dist(dev) : -1;
     if (dm >= 0)
         LINE(COLOR_GREY, "Dist: ~%d.%dm", dm / 10, dm % 10);
 
@@ -971,6 +1895,10 @@ static void render_bt_detail(ui_state_t *st)
     } else {
         LINE(COLOR_GREY, "Type: Classic");
     }
+    const char *vnd = bt_vendor(dev);
+    if (vnd) LINE(COLOR_GREY, "OUI:  %s", vnd);
+    const char *tag = bt_tag(dev);
+    if (tag && dev->company_id != 0x004C) LINE(COLOR_GREY, "Tag:  %s", tag);
 
     if (ble && dev->adv_type != BT_ADV_TYPE_NONE) {
         static const char *const adv[] = {
@@ -1111,7 +2039,8 @@ static void render_wifi_detail(ui_state_t *st)
 
     /* Title: SSID (truncated to fit title bar at scale 2) */
     char title[20];
-    snprintf(title, sizeof(title), "%.18s", net->ssid);
+    snprintf(title, sizeof(title), "%s%.17s", watch_has_wifi(net) ? "*" : "",
+             wifi_name(net));
     draw_title(title);
     clear_content();
 
@@ -1163,7 +2092,13 @@ static void render_wifi_detail(ui_state_t *st)
     }
 
     snprintf(tmp, sizeof(tmp), "Sec: %s", auth_label(net->auth_mode));
-    draw_detail_row(row++, tmp, COLOR_GREY);
+    draw_detail_row(row++, tmp, auth_color(net->auth_mode));
+
+    const char *vnd = mac_vendor(net->bssid[0], net->bssid[1], net->bssid[2]);
+    if (vnd) {
+        snprintf(tmp, sizeof(tmp), "Vnd: %s", vnd);
+        draw_detail_row(row++, tmp, COLOR_GREY);
+    }
 
     /* Channel congestion: other networks heard this scan on the same
      * channel, or within 4 channels (overlapping 20 MHz at 2.4 GHz). */
@@ -1187,6 +2122,74 @@ static void render_wifi_detail(ui_state_t *st)
     render_rssi_graph(s_rssi_history, s_graph_head);
 }
 
+/* Every BSSID of the detail panel's network: channel, RSSI and the last
+ * three octets (the first three are usually the same vendor OUI). */
+static void render_wifi_aps(ui_state_t *st)
+{
+    char title[20];
+    snprintf(title, sizeof(title), "APs %.14s", wifi_name(&s_detail_key));
+    draw_title(title);
+    clear_content();
+
+    if (s_ap_count == 0) {
+        draw_message("Scanning...");
+        return;
+    }
+    for (int i = 0; i < s_ap_count; i++) {
+        int view = i - st->scroll;
+        if (view < 0 || view >= (int)VISIBLE_ROWS) continue;
+        const ap_entry_t *ap = &s_ap_list[i];
+        char line[20];
+        snprintf(line, sizeof(line), "%2d %4d %02X:%02X:%02X", ap->channel,
+                 (int)ap->rssi, ap->bssid[3], ap->bssid[4], ap->bssid[5]);
+        draw_row(view, line, rssi_color(ap->rssi), i == st->sel);
+    }
+}
+
+/* Watched entries (status, kind, name), then the latest events. */
+static void render_watch(ui_state_t *st)
+{
+    draw_title("Watch");
+    clear_content();
+
+    if (s_watch_count == 0) {
+        draw_message("List empty");
+        draw_row(1, "Add: A on WiFi", COLOR_GREY, false);
+        draw_row(2, "detail, X in BT", COLOR_GREY, false);
+        draw_row(3, "finder", COLOR_GREY, false);
+        return;
+    }
+
+    char line[24];
+    int  row = 0;
+    for (int i = 0; i < s_watch_count; i++) {
+        int view = i - st->scroll;
+        if (view < 0 || view >= (int)VISIBLE_ROWS) continue;
+        const watch_t *w = &s_watch[i];
+        static const char st_ch[] = { '?', '+', '-' };
+        static const uint8_t st_col[] = { COLOR_GREY, COLOR_GREEN, COLOR_RED };
+        snprintf(line, sizeof(line), "%c%c %.14s", st_ch[w->state],
+                 w->kind == 'B' ? 'B' : 'W', w->name);
+        draw_row(view, line, st_col[w->state], i == st->sel);
+        row = view + 1;
+    }
+
+    /* Events, newest first, in the rows left over. */
+    uint32_t now = now_ms();
+    for (int k = 0; k < s_watch_ev_count && row < (int)VISIBLE_ROWS; k++, row++) {
+        const watch_event_t *e =
+            &s_watch_ev[(s_watch_ev_head - 1 - k + 2 * WATCH_EVENTS) % WATCH_EVENTS];
+        uint32_t age = (now - e->ms) / 1000u;
+        if (age < 600u)
+            snprintf(line, sizeof(line), "%c%-10.10s%4lus", e->arrived ? '+' : '-',
+                     e->name, (unsigned long)age);
+        else
+            snprintf(line, sizeof(line), "%c%-10.10s%4lum", e->arrived ? '+' : '-',
+                     e->name, (unsigned long)(age / 60u));
+        draw_row(row, line, COLOR_GREY, false);
+    }
+}
+
 static void render_about(void)
 {
     draw_title("About");
@@ -1195,7 +2198,7 @@ static void render_about(void)
     uint32_t used = 0u, free_bytes = 0u, largest = 0u;
     kmem_stats(&used, &free_bytes, &largest);
 
-    char lines[6][20];
+    char lines[7][20];
     snprintf(lines[0], sizeof(lines[0]), "NetMon: v" NETMON_VERSION);
     snprintf(lines[1], sizeof(lines[1]), "picoOS: v%d.%d.%d",
              PICOOS_VERSION_MAJOR, PICOOS_VERSION_MINOR, PICOOS_VERSION_EDIT);
@@ -1204,7 +2207,11 @@ static void render_about(void)
     snprintf(lines[4], sizeof(lines[4]), " Used: %5u B", (unsigned)used);
     snprintf(lines[5], sizeof(lines[5]), " Max:  %5u B", (unsigned)largest);
 
-    for (int i = 0; i < 6; i++) {
+    kmutex_lock(&s_log_lock);
+    snprintf(lines[6], sizeof(lines[6]), "Log: W%d B%d", s_wlog_n, s_blog_n);
+    kmutex_unlock(&s_log_lock);
+
+    for (int i = 0; i < 7; i++) {
         int y = (int)TITLE_H + i * (int)ROW_H + ((int)ROW_H - 16) / 2;
         disp_text_arg_t t = {
             .x = TEXT_X, .y = (uint16_t)y,
@@ -1215,35 +2222,183 @@ static void render_about(void)
     }
 }
 
+#define CHAN_SLOT_W   ((int)DISP_WIDTH / SURVEY_CHANS)
+#define CHAN_X0       (((int)DISP_WIDTH - CHAN_SLOT_W * SURVEY_CHANS) / 2)
+#define CHAN_TEXT_Y   ((int)DISP_HEIGHT - 3 * (int)DETAIL_ROW_H)
+#define CHAN_LABEL_Y  (CHAN_TEXT_Y - 10)
+#define CHAN_BAR_BOT  (CHAN_LABEL_Y - 2)
+#define CHAN_BAR_TOP  ((int)TITLE_H + 4)
+#define CHAN_LOAD_MAX 60          /* load at full bar height */
+
+static void draw_text_at(int x, int y, const char *s, uint8_t fg, uint8_t bg,
+                         uint8_t scale)
+{
+    disp_text_arg_t t = {
+        .x = (uint16_t)x, .y = (uint16_t)y,
+        .color = fg, .bg = bg, .scale = scale, ._pad = 0,
+        .str = s
+    };
+    dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_TEXT, &t);
+}
+
+/* History of the selected channel: load bars (colored by load) with the
+ * noise floor as white dots (-100 dBm at the bottom, -60 at the top). */
+static void render_chan_history(void)
+{
+    int top = CHAN_BAR_TOP, bot = CHAN_LABEL_Y + 8;
+    int span = bot - top + 1;
+    for (int x = 0; x < (int)DISP_WIDTH; x++) {
+        int gap_rel = (x - s_chan_hist_head + (int)DISP_WIDTH) % (int)DISP_WIDTH;
+        if (gap_rel < (int)GRAPH_GAP_W) continue;
+        int lv = s_chan_hist_load[x];
+        if (lv == 0) continue;
+        int load = lv - 1;
+        int h = load * span / CHAN_LOAD_MAX;
+        if (h < 1)    h = 1;
+        if (h > span) h = span;
+        disp_rect_arg_t bar = {
+            .x = (uint16_t)x, .y = (uint16_t)(bot - h + 1), .w = 1, .h = (uint16_t)h,
+            .color = load_color(load), .filled = 1, ._pad1 = 0, ._pad2 = 0
+        };
+        dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &bar);
+
+        int nv = s_chan_hist_noise[x];
+        if (nv != 0) {
+            int ny = bot - (nv + 100) * (span - 2) / 40 - 1;
+            if (ny < top)     ny = top;
+            if (ny > bot - 1) ny = bot - 1;
+            disp_rect_arg_t dot = {
+                .x = (uint16_t)x, .y = (uint16_t)ny, .w = 1, .h = 2,
+                .color = COLOR_WHITE, .filled = 1, ._pad1 = 0, ._pad2 = 0
+            };
+            dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &dot);
+        }
+    }
+}
+
+static void render_channels(ui_state_t *st)
+{
+    if (st->chan_hist) {
+        char title[20];
+        snprintf(title, sizeof(title), "Ch%d History", st->sel + 1);
+        draw_title(title);
+    } else {
+        draw_title("Channels");
+    }
+    clear_content();
+
+    chan_stat_t cs[SURVEY_CHANS];
+    int         load[SURVEY_CHANS];
+    bool        any = false;
+    for (int ch = 0; ch < SURVEY_CHANS; ch++) {
+        cs[ch] = survey_chan(ch);
+        if (cs[ch].aps > 0) any = true;
+    }
+    for (int ch = 0; ch < SURVEY_CHANS; ch++)
+        load[ch] = survey_load(cs, ch);
+
+    if (!any) {
+        draw_message(s_scanning_wifi ? "Scanning..." : "No networks found");
+        return;
+    }
+
+    int bar_span = CHAN_BAR_BOT - CHAN_BAR_TOP + 1;
+    if (st->chan_hist) render_chan_history();
+    for (int ch = 0; ch < SURVEY_CHANS && !st->chan_hist; ch++) {
+        int x = CHAN_X0 + ch * CHAN_SLOT_W;
+        int h = load[ch] * bar_span / CHAN_LOAD_MAX;
+        if (h < 1)        h = 1;
+        if (h > bar_span) h = bar_span;
+        disp_rect_arg_t bar = {
+            .x = (uint16_t)(x + 2), .y = (uint16_t)(CHAN_BAR_BOT - h + 1),
+            .w = (uint16_t)(CHAN_SLOT_W - 4), .h = (uint16_t)h,
+            .color = load_color(load[ch]), .filled = 1, ._pad1 = 0, ._pad2 = 0
+        };
+        dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &bar);
+
+        char num[4];
+        snprintf(num, sizeof(num), "%d", ch + 1);
+        int lx = x + (CHAN_SLOT_W - (int)strlen(num) * 8) / 2;
+        bool sel = ch == st->sel;
+        draw_text_at(lx, CHAN_LABEL_Y, num, sel ? COLOR_WHITE : COLOR_GREY,
+                     sel ? COLOR_RED : COLOR_PANEL, 1);
+    }
+
+    /* Least-loaded of the non-overlapping channels 1, 6 and 11. */
+    int best = 0;
+    if (load[5]  < load[best]) best = 5;
+    if (load[10] < load[best]) best = 10;
+
+    const chan_stat_t *c = &cs[st->sel];
+    char tmp[24];
+    snprintf(tmp, sizeof(tmp), "Ch%d Load:%d", st->sel + 1, load[st->sel]);
+    draw_text_at(SEL_X, CHAN_TEXT_Y + 1, tmp, load_color(load[st->sel]),
+                 COLOR_PANEL, 2);
+
+    if (c->aps > 0)
+        snprintf(tmp, sizeof(tmp), "APs:%d Sig:%d", c->aps, c->best_rssi);
+    else
+        snprintf(tmp, sizeof(tmp), "APs:0");
+    draw_text_at(SEL_X, CHAN_TEXT_Y + (int)DETAIL_ROW_H + 1, tmp, COLOR_GREY,
+                 COLOR_PANEL, 2);
+
+    if (c->noise != 0)
+        snprintf(tmp, sizeof(tmp), "N:%d", c->noise);
+    else
+        snprintf(tmp, sizeof(tmp), "N:--");
+    draw_text_at(SEL_X, CHAN_TEXT_Y + 2 * (int)DETAIL_ROW_H + 1, tmp,
+                 noise_color(c->noise), COLOR_PANEL, 2);
+
+    snprintf(tmp, sizeof(tmp), "Best:%d", best + 1);
+    draw_text_at((int)DISP_WIDTH - (int)strlen(tmp) * 16 - (int)SEL_X,
+                 CHAN_TEXT_Y + 2 * (int)DETAIL_ROW_H + 1, tmp, COLOR_GREY,
+                 COLOR_PANEL, 2);
+}
+
 static void render_screen(ui_state_t *st)
 {
     switch (st->screen) {
-    case SCR_HOME:        render_home(st);        break;
+    case SCR_HOME: case SCR_WIFI_MENU: case SCR_BT_MENU:
+                          render_menu(st);        break;
     case SCR_WIFI:        render_wifi(st);        break;
     case SCR_BT:          render_bt(st);          break;
     case SCR_BT_DETAIL:   render_bt_detail(st);   break;
     case SCR_ABOUT:       render_about();         break;
     case SCR_WIFI_DETAIL: render_wifi_detail(st); break;
+    case SCR_CHANNELS:    render_channels(st);    break;
+    case SCR_WIFI_APS:    render_wifi_aps(st);    break;
+    case SCR_BT_FINDER:   render_bt_finder(st);   break;
+    case SCR_WATCH:       render_watch(st);       break;
     }
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_FLUSH, NULL);
 }
 
 /* ---- navigation ----------------------------------------------------------- */
 
+typedef enum { RADIO_NONE = 0, RADIO_WIFI, RADIO_BT, RADIO_WATCH } radio_t;
+static radio_t screen_radio(screen_t s);
+static bool    s_log_flush = false;   /* main: save the logs now */
+
 /* Lock guarding the scan cache a screen reads, or NULL if it reads none. */
 static kmutex_t *screen_lock(screen_t s)
 {
     switch (s) {
-    case SCR_WIFI: case SCR_WIFI_DETAIL: return &s_wifi_lock;
-    case SCR_BT:   case SCR_BT_DETAIL:   return &s_bt_lock;
+    case SCR_WIFI: case SCR_WIFI_DETAIL: case SCR_CHANNELS: case SCR_WIFI_APS:
+        return &s_wifi_lock;
+    case SCR_BT:   case SCR_BT_DETAIL:   case SCR_BT_FINDER:
+        return &s_bt_lock;
+    case SCR_WATCH:
+        return &s_watch_lock;
     default:                             return NULL;
     }
 }
 
+/* Open screen `s` from a menu (no lock is held there), saving the menu's
+ * cursor for the way back. */
 static void enter_screen(ui_state_t *st, screen_t s)
 {
-    st->prev_sel    = st->sel;
-    st->prev_scroll = st->scroll;
+    int m = screen_menu(st->screen);
+    if (m >= 0) st->menu_sel[m] = st->sel;
     st->screen       = s;
     st->sel          = 0;
     st->scroll       = 0;
@@ -1254,7 +2409,16 @@ static void enter_screen(ui_state_t *st, screen_t s)
         s_wifi_ucount = 0;
         memset(s_wifi_chan_count, 0, sizeof(s_wifi_chan_count));
         memset(s_wifi_seen, 0, sizeof(s_wifi_seen));
+        memset(s_wifi_last_win, 0, sizeof(s_wifi_last_win));
+        s_ap_key_set = false;
         kmutex_unlock(&s_wifi_lock);
+    } else if (s == SCR_CHANNELS) {
+        kmutex_lock(&s_wifi_lock);
+        memset(s_survey, 0, sizeof(s_survey));
+        s_survey_head = 0;
+        kmutex_unlock(&s_wifi_lock);
+        st->chan_hist = false;
+        chan_hist_reset();
     } else if (s == SCR_BT) {
         kmutex_lock(&s_bt_lock);
         s_bt_count    = 0;
@@ -1266,20 +2430,27 @@ static void enter_screen(ui_state_t *st, screen_t s)
     s_active_screen = s;
 }
 
-static void back_to_home(ui_state_t *st)
+/* Y: go up to the screen's menu, stopping its radio, and put the menu's
+ * cursor back where it was. */
+static void leave_screen(ui_state_t *st)
 {
     screen_t from = st->screen;
+    screen_t to   = screen_parent(from);
 
-    /* Publish HOME before stopping the radio: the stop wakes the worker
-     * out of *_scan_wait() at once, and it must then see HOME, not the
-     * old screen, or it restarts the scan for another window. */
-    s_active_screen = SCR_HOME;
-    if (from == SCR_WIFI || from == SCR_WIFI_DETAIL) wifi_scan_stop();
-    if (from == SCR_BT   || from == SCR_BT_DETAIL)   bt_scan_stop();
+    /* Publish the menu before stopping the radio: the stop wakes the
+     * worker out of *_scan_wait() at once, and it must then see a screen
+     * with no radio, not the old one, or it restarts the scan. */
+    s_active_screen = to;
+    radio_t r = screen_radio(from);
+    if (r == RADIO_WIFI || r == RADIO_WATCH) wifi_scan_stop();
+    if (r == RADIO_BT   || r == RADIO_WATCH) bt_scan_stop();
+    if (r != RADIO_NONE) s_log_flush = true;
 
-    st->screen = SCR_HOME;
-    st->sel    = st->prev_sel;
-    st->scroll = st->prev_scroll;
+    int m = screen_menu(to);
+    st->screen = to;
+    st->sel    = st->menu_sel[m];
+    st->scroll = 0;
+    adjust_scroll(st, s_menus[m].count);
     st->dirty  = true;
 }
 
@@ -1288,20 +2459,21 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
     if (!pressed) return;
 
     switch (st->screen) {
-    case SCR_HOME: {
-        enum { HOME_COUNT = 3 };
-        if (pressed & DISP_BTN_A) {
-            if (st->sel > 0) { st->sel--; st->dirty = true; }
+    case SCR_HOME: case SCR_WIFI_MENU: case SCR_BT_MENU: {
+        const menu_t *m = &s_menus[screen_menu(st->screen)];
+        if ((pressed & DISP_BTN_A) && st->sel > 0) {
+            st->sel--; st->dirty = true;
         }
-        if (pressed & DISP_BTN_B) {
-            if (st->sel < HOME_COUNT - 1) { st->sel++; st->dirty = true; }
+        if ((pressed & DISP_BTN_B) && st->sel < m->count - 1) {
+            st->sel++; st->dirty = true;
         }
+        adjust_scroll(st, m->count);
         if (pressed & DISP_BTN_X) {
-            switch (st->sel) {
-            case 0: enter_screen(st, SCR_BT);    break;
-            case 1: enter_screen(st, SCR_WIFI);  break;
-            case 2: enter_screen(st, SCR_ABOUT); break;
-            }
+            const menu_item_t *it = &m->items[st->sel];
+            st->bt_filter = it->bt_filter;
+            enter_screen(st, it->target);
+        } else if ((pressed & DISP_BTN_Y) && st->screen != SCR_HOME) {
+            leave_screen(st);
         }
         break;
     }
@@ -1329,40 +2501,75 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
                 st->dirty       = true;
                 memset(s_rssi_history, 0, sizeof(s_rssi_history));
                 s_graph_head = 0;
+                /* Main holds s_wifi_lock here (screen_lock(SCR_WIFI)). */
+                s_detail_key = s_wifi_cache[st->sel];
+                s_ap_key     = s_detail_key;
+                s_ap_key_set = true;
+                s_ap_count   = 0;
             }
         }
-        if (pressed & DISP_BTN_Y) back_to_home(st);
+        if (pressed & DISP_BTN_Y) leave_screen(st);
         break;
     }
     case SCR_WIFI_DETAIL:
+        if ((pressed & DISP_BTN_A) && st->detail_idx >= 0 &&
+            st->detail_idx < s_wifi_ucount) {
+            watch_toggle_wifi(&s_wifi_cache[st->detail_idx]);
+            st->dirty = true;
+        }
+        if (pressed & DISP_BTN_X) {
+            st->screen = SCR_WIFI_APS;
+            st->sel    = 0;
+            st->scroll = 0;
+            st->dirty  = true;
+        }
         if (pressed & DISP_BTN_Y) {
-            st->screen = SCR_WIFI;
-            st->sel    = st->wifi_sel;
-            st->scroll = st->wifi_scroll;
+            st->screen   = SCR_WIFI;
+            st->sel      = st->wifi_sel;
+            st->scroll   = st->wifi_scroll;
+            st->dirty    = true;
+            s_ap_key_set = false;
+        }
+        break;
+    case SCR_WIFI_APS:
+        if ((pressed & DISP_BTN_A) && st->sel > 0) {
+            st->sel--;
+            adjust_scroll(st, s_ap_count);
+            st->dirty = true;
+        }
+        if ((pressed & DISP_BTN_B) && st->sel < s_ap_count - 1) {
+            st->sel++;
+            adjust_scroll(st, s_ap_count);
+            st->dirty = true;
+        }
+        if (pressed & DISP_BTN_Y) {
+            st->screen = SCR_WIFI_DETAIL;
             st->dirty  = true;
         }
         break;
     case SCR_BT: {
-        if (s_bt_count > 0) {
+        int map[BT_MAX_SCAN_RESULTS];
+        int n = bt_view(st, map);
+        if (n > 0) {
             if (pressed & DISP_BTN_A) {
                 if (st->sel > 0) {
                     st->sel--;
-                    adjust_scroll(st, s_bt_count);
+                    adjust_scroll(st, n);
                     st->dirty = true;
                 }
             }
             if (pressed & DISP_BTN_B) {
-                if (st->sel < s_bt_count - 1) {
+                if (st->sel < n - 1) {
                     st->sel++;
-                    adjust_scroll(st, s_bt_count);
+                    adjust_scroll(st, n);
                     st->dirty = true;
                 }
             }
-            if (pressed & DISP_BTN_X) {
+            if ((pressed & DISP_BTN_X) && st->sel < n) {
                 st->bt_sel        = st->sel;
                 st->bt_scroll     = st->scroll;
-                st->bt_detail_idx = st->sel;
-                memcpy(st->bt_detail_addr, s_bt_cache[st->sel].addr, BT_ADDR_LEN);
+                st->bt_detail_idx = map[st->sel];
+                memcpy(st->bt_detail_addr, s_bt_cache[map[st->sel]].addr, BT_ADDR_LEN);
                 st->detail_scroll = 0;
                 st->screen        = SCR_BT_DETAIL;
                 st->dirty         = true;
@@ -1370,13 +2577,14 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
                 s_bt_graph_head   = 0;
             }
         }
-        if (pressed & DISP_BTN_Y) back_to_home(st);
+        if (pressed & DISP_BTN_Y) leave_screen(st);
         break;
     }
     case SCR_BT_DETAIL:
         /* render_bt_detail() clamps the scroll to the rows it has. */
         if (pressed & DISP_BTN_A) { st->detail_scroll--; st->dirty = true; }
         if (pressed & DISP_BTN_B) { st->detail_scroll++; st->dirty = true; }
+        if (pressed & DISP_BTN_X) { st->screen = SCR_BT_FINDER; st->dirty = true; }
         if (pressed & DISP_BTN_Y) {
             st->screen = SCR_BT;
             st->sel    = st->bt_sel;
@@ -1384,8 +2592,51 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
             st->dirty  = true;
         }
         break;
+    case SCR_BT_FINDER:
+        if ((pressed & DISP_BTN_X) && st->bt_detail_idx >= 0 &&
+            st->bt_detail_idx < s_bt_count) {
+            watch_toggle_bt(&s_bt_cache[st->bt_detail_idx]);
+            st->dirty = true;
+        }
+        if (pressed & DISP_BTN_Y) { st->screen = SCR_BT_DETAIL; st->dirty = true; }
+        break;
+    case SCR_CHANNELS:
+        if ((pressed & DISP_BTN_A) && st->sel > 0) {
+            st->sel--; st->dirty = true;
+            chan_hist_reset();
+        }
+        if ((pressed & DISP_BTN_B) && st->sel < SURVEY_CHANS - 1) {
+            st->sel++; st->dirty = true;
+            chan_hist_reset();
+        }
+        if (pressed & DISP_BTN_X) {
+            st->chan_hist = !st->chan_hist;
+            st->dirty     = true;
+        }
+        if (pressed & DISP_BTN_Y) leave_screen(st);
+        break;
+    case SCR_WATCH:
+        /* Main holds s_watch_lock here (screen_lock(SCR_WATCH)). */
+        if ((pressed & DISP_BTN_A) && st->sel > 0) {
+            st->sel--;
+            adjust_scroll(st, s_watch_count);
+            st->dirty = true;
+        }
+        if ((pressed & DISP_BTN_B) && st->sel < s_watch_count - 1) {
+            st->sel++;
+            adjust_scroll(st, s_watch_count);
+            st->dirty = true;
+        }
+        if ((pressed & DISP_BTN_X) && st->sel < s_watch_count) {
+            watch_remove_locked(st->sel);
+            if (st->sel >= s_watch_count && st->sel > 0) st->sel--;
+            adjust_scroll(st, s_watch_count);
+            st->dirty = true;
+        }
+        if (pressed & DISP_BTN_Y) leave_screen(st);
+        break;
     case SCR_ABOUT:
-        if (pressed & DISP_BTN_Y) back_to_home(st);
+        if (pressed & DISP_BTN_Y) leave_screen(st);
         break;
     }
 }
@@ -1400,13 +2651,19 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
  *
  * The scan is owned by this process: if netmon is killed, picoOS stops it.  */
 
-typedef enum { RADIO_NONE = 0, RADIO_WIFI, RADIO_BT } radio_t;
+/* RADIO_WATCH (the Watch screen) alternates WiFi and BT. */
+#define WATCH_WIFI_WINDOWS  3u      /* per WiFi turn on the Watch screen */
+#define WATCH_BT_WINDOWS   12u      /* per BT turn: one whole inquiry    */
 
 static radio_t screen_radio(screen_t s)
 {
     switch (s) {
-    case SCR_WIFI: case SCR_WIFI_DETAIL: return RADIO_WIFI;
-    case SCR_BT:   case SCR_BT_DETAIL:   return RADIO_BT;
+    case SCR_WIFI: case SCR_WIFI_DETAIL: case SCR_CHANNELS: case SCR_WIFI_APS:
+        return RADIO_WIFI;
+    case SCR_BT:   case SCR_BT_DETAIL:   case SCR_BT_FINDER:
+        return RADIO_BT;
+    case SCR_WATCH:
+        return RADIO_WATCH;
     default:                             return RADIO_NONE;
     }
 }
@@ -1440,10 +2697,15 @@ static void merge_wifi_window(const wifi_scan_list_t *l)
     int n = build_dedup(l->items, l->count, idx, aps, WIFI_MAX_SCAN_RESULTS);
 
     kmutex_lock(&s_wifi_lock);
-    merge_into_cache(l->items, idx, aps, n);
+    merge_into_cache(l->items, idx, aps, n, l->seq);
+    ap_track(l->items, l->count, l->seq);
+    survey_window(l->items, l->count);
     s_scanning_wifi = false;
     s_new_wifi_data = true;
     kmutex_unlock(&s_wifi_lock);
+
+    watch_wifi_window(l->items, l->count);
+    log_wifi_window(l->items, l->count);
 }
 
 static void merge_bt_window(const bt_scan_list_t *l)
@@ -1454,15 +2716,26 @@ static void merge_bt_window(const bt_scan_list_t *l)
     s_new_bt_data = true;
     s_bt_scan_end = true;
     kmutex_unlock(&s_bt_lock);
+
+    watch_bt_window(l->items, l->count);
+    log_bt_window(l->items, l->count);
 }
 
 static void scan_worker_entry(void *arg)
 {
     (void)arg;
     radio_t running = RADIO_NONE;
+    radio_t phase   = RADIO_WIFI;   /* Watch screen: radio taking its turn */
+    unsigned turn   = 0u;           /* windows into that turn              */
 
     for (;;) {
         radio_t want = screen_radio(s_active_screen);
+        if (want == RADIO_WATCH) {
+            want = phase;
+        } else {
+            phase = RADIO_WIFI;
+            turn  = 0u;
+        }
 
         if (want != running) {
             radio_stop(running);
@@ -1479,7 +2752,7 @@ static void scan_worker_entry(void *arg)
         }
 
         /* Blocks until the next window (at most ~1 s), or returns STOPPED
-         * when back_to_home() stops the radio. */
+         * when leave_screen() stops the radio. */
         int rc;
         if (running == RADIO_WIFI) {
             const wifi_scan_list_t *l;
@@ -1490,7 +2763,14 @@ static void scan_worker_entry(void *arg)
             rc = bt_scan_wait(&l);
             if (rc == 0) merge_bt_window(l);
         }
-        if (rc != 0) running = RADIO_NONE;   /* stopped: re-evaluate */
+        if (rc != 0) {
+            running = RADIO_NONE;   /* stopped: re-evaluate */
+        } else if (screen_radio(s_active_screen) == RADIO_WATCH &&
+                   ++turn >= (phase == RADIO_WIFI ? WATCH_WIFI_WINDOWS
+                                                  : WATCH_BT_WINDOWS)) {
+            phase = phase == RADIO_WIFI ? RADIO_BT : RADIO_WIFI;
+            turn  = 0u;
+        }
     }
 }
 
@@ -1502,9 +2782,21 @@ void netmon_entry(void *arg)
 
     kmutex_init(&s_wifi_lock);
     kmutex_init(&s_bt_lock);
+    kmutex_init(&s_watch_lock);
+    kmutex_init(&s_log_lock);
     s_active_screen = SCR_HOME;
+    s_watch_count = 0;
+    s_watch_ev_count = 0;
+    s_wlog_n = 0;
+    s_blog_n = 0;
+    s_log_dirty = false;
+    watch_load();
 
     dev_open(DEV_DISPLAY);
+#ifdef PICOOS_LED_ENABLE
+    dev_open(DEV_LED);
+    dev_ioctl(DEV_LED, IOCTL_LED_OFF, NULL);
+#endif
 
     uint8_t bg = COLOR_PANEL;
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_SET_BG, &bg);
@@ -1531,8 +2823,7 @@ void netmon_entry(void *arg)
         .screen        = SCR_HOME,
         .sel           = 0,
         .scroll        = 0,
-        .prev_sel      = 0,
-        .prev_scroll   = 0,
+        .menu_sel      = {0},
         .wifi_sel      = 0,
         .wifi_scroll   = 0,
         .detail_idx    = 0,
@@ -1542,26 +2833,58 @@ void netmon_entry(void *arg)
         .detail_scroll = 0,
         .dirty         = true,
     };
-    uint8_t prev_btns = 0u;
+    uint8_t  prev_btns   = 0u;
+    uint32_t seen_seq    = s_watch_seq;
+    uint32_t last_save   = now_ms();
+    uint32_t last_tick   = 0u;       /* Watch screen: last 1 s refresh   */
+    uint32_t save_retry  = 0u;       /* watch file: last failed save      */
+    bool     save_wait   = false;
+#ifdef PICOOS_LED_ENABLE
+    uint32_t led_rgb     = 0u;       /* what the LED shows now            */
+    uint32_t flash_rgb   = 0u;       /* watch event flash color           */
+    uint32_t flash_until = 0u;
+#endif
 
     for (;;) {
         /* Hold the active screen's cache lock across data intake, input
          * handling and rendering so the worker cannot merge mid-read.
          * Captured up front because handle_input() may change st.screen
-         * (enter_screen() takes the target lock itself, from HOME only). */
+         * (enter_screen() takes the target lock itself, from a menu only). */
         kmutex_t *lk = screen_lock(st.screen);
         if (lk) kmutex_lock(lk);
 
+        if (s_new_wifi_data && st.screen == SCR_CHANNELS) {
+            s_new_wifi_data = false;
+            chan_hist_push(st.sel);
+            st.dirty = true;
+        }
+
         if (s_new_wifi_data &&
-            (st.screen == SCR_WIFI || st.screen == SCR_WIFI_DETAIL)) {
+            (st.screen == SCR_WIFI || st.screen == SCR_WIFI_DETAIL ||
+             st.screen == SCR_WIFI_APS)) {
             s_new_wifi_data = false;
             int ucount = s_wifi_ucount;
+            /* The detail network's slot was reused for another network:
+             * go back to the list rather than show the wrong one. */
+            if (st.screen != SCR_WIFI &&
+                (st.detail_idx < 0 || st.detail_idx >= ucount ||
+                 !same_net(&s_wifi_cache[st.detail_idx], &s_detail_key))) {
+                st.screen    = SCR_WIFI;
+                st.sel       = st.wifi_sel;
+                st.scroll    = st.wifi_scroll;
+                s_ap_key_set = false;
+            }
+            if (st.screen == SCR_WIFI_APS) {
+                if (st.sel >= s_ap_count)
+                    st.sel = s_ap_count > 0 ? s_ap_count - 1 : 0;
+                adjust_scroll(&st, s_ap_count);
+            }
             if (st.screen == SCR_WIFI) {
                 if (st.sel >= ucount)
                     st.sel = ucount > 0 ? ucount - 1 : 0;
                 adjust_scroll(&st, ucount);
             }
-            if (st.screen == SCR_WIFI_DETAIL &&
+            if ((st.screen == SCR_WIFI_DETAIL || st.screen == SCR_WIFI_APS) &&
                 st.detail_idx >= 0 && st.detail_idx < ucount) {
                 /* Not heard this window: record a gap (0) rather than
                  * repeating the stale cached reading. */
@@ -1573,12 +2896,13 @@ void netmon_entry(void *arg)
         }
 
         if (s_new_bt_data &&
-            (st.screen == SCR_BT || st.screen == SCR_BT_DETAIL)) {
+            (st.screen == SCR_BT || st.screen == SCR_BT_DETAIL ||
+             st.screen == SCR_BT_FINDER)) {
             s_new_bt_data = false;
             int bcount = s_bt_count;
             /* The detail device's slot was reused for another device:
              * go back to the list rather than show the wrong one. */
-            if (st.screen == SCR_BT_DETAIL &&
+            if (st.screen != SCR_BT &&
                 (st.bt_detail_idx < 0 || st.bt_detail_idx >= bcount ||
                  memcmp(s_bt_cache[st.bt_detail_idx].addr, st.bt_detail_addr,
                         BT_ADDR_LEN) != 0)) {
@@ -1587,13 +2911,15 @@ void netmon_entry(void *arg)
                 st.scroll = st.bt_scroll;
             }
             if (st.screen == SCR_BT) {
-                if (st.sel >= bcount)
-                    st.sel = bcount > 0 ? bcount - 1 : 0;
-                adjust_scroll(&st, bcount);
+                int map[BT_MAX_SCAN_RESULTS];
+                int vn = bt_view(&st, map);
+                if (st.sel >= vn)
+                    st.sel = vn > 0 ? vn - 1 : 0;
+                adjust_scroll(&st, vn);
             }
             /* One column per scan window; a gap (0) if the device was not
              * heard recently, rather than repeating the stale reading. */
-            if (s_bt_scan_end && st.screen == SCR_BT_DETAIL &&
+            if (s_bt_scan_end && st.screen != SCR_BT &&
                 st.bt_detail_idx >= 0 && st.bt_detail_idx < bcount) {
                 s_bt_rssi_history[s_bt_graph_head] = s_bt_seen[st.bt_detail_idx]
                     ? s_bt_cache[st.bt_detail_idx].rssi : 0;
@@ -1626,7 +2952,7 @@ void netmon_entry(void *arg)
 
         handle_input(&st, pressed);
 
-        /* A HOME → WIFI/BT transition happened without lk; take the new
+        /* A menu → scan screen transition happened without lk; take the new
          * screen's lock before rendering its cache. */
         kmutex_t *rlk = screen_lock(st.screen);
         if (rlk != lk) {
@@ -1635,12 +2961,72 @@ void netmon_entry(void *arg)
             if (lk) kmutex_lock(lk);
         }
 
+        uint32_t now = now_ms();
+        if (st.screen == SCR_WATCH && now - last_tick >= 1000u) {
+            last_tick = now;       /* status and event ages */
+            st.dirty  = true;
+        }
+
         if (st.dirty) {
             render_screen(&st);
             st.dirty = false;
         }
 
         if (lk) kmutex_unlock(lk);
+
+        /* ---- no lock held below ---- */
+
+        /* Watch events: report each on the console and flash the LED,
+         * green for an arrival, red for a departure. */
+        if (s_watch_seq != seen_seq) {
+            kmutex_lock(&s_watch_lock);
+            uint32_t seq = s_watch_seq;     /* stable while we hold the lock */
+            uint32_t n   = seq - seen_seq;
+            if (n > WATCH_EVENTS) n = WATCH_EVENTS;
+            for (uint32_t k = n; k > 0u; k--) {
+                const watch_event_t *e = &s_watch_ev[
+                    (s_watch_ev_head - (int)k + 2 * WATCH_EVENTS) % WATCH_EVENTS];
+                printf("[netmon] watch: %s %s\r\n", e->name,
+                       e->arrived ? "arrived" : "left");
+#ifdef PICOOS_LED_ENABLE
+                flash_rgb = e->arrived ? 0x00FF00u : 0xFF0000u;
+#endif
+            }
+            kmutex_unlock(&s_watch_lock);
+            seen_seq = seq;
+#ifdef PICOOS_LED_ENABLE
+            flash_until = now + 2000u;
+#endif
+            if (st.screen == SCR_WATCH) st.dirty = true;
+        }
+
+        if (s_watch_dirty && (!save_wait || now - save_retry >= 5000u)) {
+            s_watch_dirty = false;
+            save_wait     = !watch_save();
+            if (save_wait) {
+                s_watch_dirty = true;          /* fs busy: try again later */
+                save_retry    = now;
+            }
+        }
+
+        if (s_log_flush || now - last_save >= LOG_SAVE_MS) {
+            log_save();
+            s_log_flush = false;
+            last_save   = now;
+        }
+
+#ifdef PICOOS_LED_ENABLE
+        uint32_t want_rgb = 0u;
+        if ((int32_t)(flash_until - now) > 0)
+            want_rgb = ((now / 250u) & 1u) ? flash_rgb : 0u;
+        else if (st.screen == SCR_BT_FINDER)
+            want_rgb = s_finder_rgb;
+        if (want_rgb != led_rgb) {
+            led_rgb = want_rgb;
+            if (want_rgb) dev_ioctl(DEV_LED, IOCTL_LED_SET_RGB, &want_rgb);
+            else          dev_ioctl(DEV_LED, IOCTL_LED_OFF, NULL);
+        }
+#endif
 
         sys_sleep(20);
     }
