@@ -52,7 +52,7 @@ Home
 ├── WiFi
 │   ├── Scan ─────── network list ── X: detail ── X: access points
 │   │                                  A: watch / unwatch
-│   └── Channels ─── per-channel load ── X: selected channel's history
+│   └── Channels ─── per-channel load ── X: selected channel's history (X or Y: back)
 ├── Bluetooth
 │   ├── Scan ─────── device list ── X: detail ── X: finder (X: watch / unwatch)
 │   ├── Beacons ──── the device list, beacons and trackers only
@@ -103,7 +103,7 @@ A live RSSI graph runs along the bottom. B scrolls the rows (wrapping back to th
   <img src="docs/images/channels-history.png" width="320" alt="Channel history">
 </p>
 
-One bar per 2.4 GHz channel (1–13) showing congestion over the last 8 scan windows. Every access point within 4 channels counts towards a channel's load, more when it is closer and double when it is strong (above −70 dBm). A / B select a channel. The bottom rows show its AP count, strongest signal and firmware noise floor, and **Best:** names the least loaded of channels 1, 6 and 11. The noise floor is colored as an interference warning: yellow at −88 dBm or above, orange at −82, red at −75. X switches to a history of the selected channel: load bars per window, with the noise floor as dots.
+One bar per 2.4 GHz channel (1–13) showing congestion over the last 8 scan windows. Every access point within 4 channels counts towards a channel's load, more when it is closer and double when it is strong (above −70 dBm). A / B select a channel. The bottom rows show its AP count, strongest signal and firmware noise floor, and **Best:** names the least loaded of channels 1, 6 and 11. The noise floor is colored as an interference warning: yellow at −88 dBm or above, orange at −82, red at −75. X switches to a history of the selected channel: load bars per window, scaled so the peak (shown as **Peak**) nearly fills the chart, with the noise floor as dots. X or Y returns to the bar chart.
 
 ### Bluetooth
 
@@ -261,7 +261,7 @@ git submodule update --init
 ./clean          # remove all build directories
 ```
 
-Images land in `kits/` as `netmon-<board>-<VERSION>.uf2` (for example `kits/netmon-picow-0.2.1.uf2`). The version comes from the `VERSION` file; increment it there before a release. Build trees live in `builds/<board>_<display>/` (for example `builds/picow_D2/`).
+Images land in `kits/` as `netmon-<board>-<VERSION>.uf2` (for example `kits/netmon-picow-0.2.2.uf2`). The version comes from the `VERSION` file; increment it there before a release. Build trees live in `builds/<board>_<display>/` (for example `builds/picow_D2/`).
 
 Firmware is built for size (`-Os`, CMake `MinSizeRel`). For `-O3`, run `BUILD_TYPE=Release ./build`. NetMon's sources are compiled with picoOS's warning set, including `-Werror`, so a new warning fails the build.
 
@@ -331,7 +331,7 @@ You can also bind it to a Display Pack button with a `BUTTONA=netmon` (or B / X 
 
 ```
 netmon/
-├── VERSION              NetMon version (e.g. 0.2.1)
+├── VERSION              NetMon version (e.g. 0.2.2)
 ├── CMakeLists.txt       Root build: board aliases, -Os default, app injection, add_subdirectory(picoOS/src)
 ├── build / clean        Convenience build and clean scripts
 ├── apps/
@@ -377,7 +377,7 @@ Rules for picoOS apps:
 
 ## Memory budget
 
-Pico W with Display Pack 2 (NetMon 0.2.1, picoOS 0.5.2, `-Os`):
+Pico W with Display Pack 2 (NetMon 0.2.2, picoOS 0.5.2, `-Os`):
 
 | | Used | Free |
 |---|---|---|

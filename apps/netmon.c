@@ -21,7 +21,8 @@
  *   WiFi detail: A watch/unwatch, B scroll (wraps), X per-SSID AP list
  *   BT detail:   X finder (in the finder, X watch/unwatch)
  *   Pairs:       X opens a pair (both devices, evidence, RSSI traces)
- *   Channels:    X bar chart <-> selected channel's history
+ *   Channels:    X bar chart <-> selected channel's history; Y in the
+ *                history returns to the bar chart
  *   Watch:       X remove the selected entry
  */
 
@@ -2649,6 +2650,8 @@ static void render_about(void)
 #define CHAN_BAR_BOT  (CHAN_LABEL_Y - 2)
 #define CHAN_BAR_TOP  ((int)TITLE_H + 4)
 #define CHAN_LOAD_MAX 60          /* load at full bar height */
+#define CHAN_HIST_MIN_FULL 12     /* history: smallest full scale, so a quiet
+                                   * channel does not fill the chart        */
 
 static void draw_text_at(int x, int y, const char *s, uint8_t fg, uint8_t bg,
                          uint8_t scale)
@@ -2662,18 +2665,29 @@ static void draw_text_at(int x, int y, const char *s, uint8_t fg, uint8_t bg,
 }
 
 /* History of the selected channel: load bars (colored by load) with the
- * noise floor as white dots (-100 dBm at the bottom, -60 at the top). */
+ * noise floor as white dots (-100 dBm at the bottom, -60 at the top).
+ * Unlike the bar chart, the load scale follows the history shown: its peak
+ * reaches 90% of the chart, and "Peak n" in the space left at the top keeps
+ * the absolute value readable. */
 static void render_chan_history(void)
 {
     int top = CHAN_BAR_TOP, bot = CHAN_LABEL_Y + 8;
     int span = bot - top + 1;
+    int peak = -1;
+    for (int x = 0; x < (int)DISP_WIDTH; x++) {
+        int gap_rel = (x - s_chan_hist_head + (int)DISP_WIDTH) % (int)DISP_WIDTH;
+        if (gap_rel < (int)GRAPH_GAP_W || s_chan_hist_load[x] == 0) continue;
+        if (s_chan_hist_load[x] - 1 > peak) peak = s_chan_hist_load[x] - 1;
+    }
+    int full = peak * 10 / 9;
+    if (full < CHAN_HIST_MIN_FULL) full = CHAN_HIST_MIN_FULL;
     for (int x = 0; x < (int)DISP_WIDTH; x++) {
         int gap_rel = (x - s_chan_hist_head + (int)DISP_WIDTH) % (int)DISP_WIDTH;
         if (gap_rel < (int)GRAPH_GAP_W) continue;
         int lv = s_chan_hist_load[x];
         if (lv == 0) continue;
         int load = lv - 1;
-        int h = load * span / CHAN_LOAD_MAX;
+        int h = load * span / full;
         if (h < 1)    h = 1;
         if (h > span) h = span;
         disp_rect_arg_t bar = {
@@ -2693,6 +2707,13 @@ static void render_chan_history(void)
             };
             dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &dot);
         }
+    }
+
+    if (peak >= 0) {
+        char lbl[12];
+        snprintf(lbl, sizeof lbl, "Peak %d", peak);
+        draw_text_at((int)DISP_WIDTH - 4 - (int)strlen(lbl) * 8, top, lbl,
+                     COLOR_GREY, COLOR_PANEL, 1);
     }
 }
 
@@ -3068,7 +3089,16 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
             st->chan_hist = !st->chan_hist;
             st->dirty     = true;
         }
-        if (pressed & DISP_BTN_Y) leave_screen(st);
+        /* Y from the history goes back to the bar chart, like any other
+         * sub-view; from the bar chart it goes up to the WiFi menu. */
+        if (pressed & DISP_BTN_Y) {
+            if (st->chan_hist) {
+                st->chan_hist = false;
+                st->dirty     = true;
+            } else {
+                leave_screen(st);
+            }
+        }
         break;
     case SCR_WATCH:
         /* Main holds s_watch_lock here (screen_lock(SCR_WATCH)). */

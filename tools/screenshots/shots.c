@@ -188,6 +188,8 @@ static void wifi_window(uint32_t win, int walk)
     for (int i = 0; i < N_WNETS; i++) {
         const wnet_t *n = &s_wnets[i];
         if (n->gone_after && (int)win > n->gone_after) continue;
+        /* The printer's network comes and goes: channel 6's history moves. */
+        if (strncmp(n->ssid, "DIRECT-", 7) == 0 && (win / 23u) % 3u == 1u) continue;
         wifi_scan_result_t *r = &l.items[l.count++];
         snprintf(r->ssid, sizeof r->ssid, "%s", n->ssid);
         oui_of(n->vendor, n->nth, r->bssid);
