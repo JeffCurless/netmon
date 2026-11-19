@@ -3,3 +3,4 @@ kits/
 compile_commands.json
 .clangd
 .cache/
+commit.txt
