@@ -202,6 +202,7 @@ sudo apt install -y \
     libstdc++-arm-none-eabi-newlib \
     build-essential \
     python3 \
+    python3-pil \
     git
 ```
 
@@ -210,7 +211,10 @@ sudo apt install -y \
 ```bash
 brew install cmake python3
 brew install --cask gcc-arm-embedded
+pip3 install pillow
 ```
+
+Pillow converts the boot splash (`art/splash.png`) at build time; the screenshot renderer uses it too.
 
 ### 2. Get the Pico SDK
 
@@ -263,7 +267,9 @@ git submodule update --init
 ./clean          # remove all build directories
 ```
 
-Images land in `kits/` as `netmon-<board>-<VERSION>.uf2` (for example `kits/netmon-picow-0.2.3.uf2`). The version comes from the `VERSION` file; increment it there before a release. Build trees live in `builds/<board>_<display>/` (for example `builds/picow_D2/`).
+Images land in `kits/` as `netmon-<board>-<VERSION>.uf2` (for example `kits/netmon-picow-0.2.4.uf2`). The version comes from the `VERSION` file; increment it there before a release. Build trees live in `builds/<board>_<display>/` (for example `builds/picow_D2/`).
+
+Display builds boot to `art/splash.png` instead of the picoOS version screen: picoOS converts it into a 75 KB array in flash (no SRAM). To use another image pass `-DPICOOS_SPLASH_IMAGE=<path>` to CMake, or `-DPICOOS_SPLASH_IMAGE=` for the version screen.
 
 Firmware is built for size (`-Os`, CMake `MinSizeRel`). For `-O3`, run `BUILD_TYPE=Release ./build`. NetMon's sources are compiled with picoOS's warning set, including `-Werror`, so a new warning fails the build.
 
@@ -333,9 +339,10 @@ You can also bind it to a Display Pack button with a `BUTTONA=netmon` (or B / X 
 
 ```
 netmon/
-├── VERSION              NetMon version (e.g. 0.2.3)
+├── VERSION              NetMon version (e.g. 0.2.4)
 ├── CMakeLists.txt       Root build: board aliases, -Os default, app injection, add_subdirectory(picoOS/src)
 ├── build / clean        Convenience build and clean scripts
+├── art/splash.png       Boot splash image (320x240), converted at build time
 ├── apps/
 │   ├── app_table.c      app_table[]: the apps the shell's `run` command can start
 │   ├── netmon.c / .h    The NetMon UI (main thread) and scan-worker thread
@@ -379,12 +386,12 @@ Rules for picoOS apps:
 
 ## Memory budget
 
-Pico W with Display Pack 2 (NetMon 0.2.3, picoOS 0.5.2, `-Os`):
+Pico W with Display Pack 2 (NetMon 0.2.4, picoOS 0.5.3, `-Os`):
 
 | | Used | Free |
 |---|---|---|
 | SRAM (264 KB) | ~232 KB | ~32 KB |
-| Flash (2 MB) | ~451 KB | Firmware must stay below the 1 MB file-system offset |
+| Flash (2 MB) | ~527 KB | Firmware must stay below the 1 MB file-system offset |
 
 The display framebuffer (75 KB) and the 64 KB kernel heap, which holds every thread stack, take the largest shares of SRAM. Keep about 30 KB of SRAM free on WiFi builds: BTstack allocates from what the linker leaves. For a full breakdown after a build:
 

@@ -67,6 +67,21 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" NETMON_VERSION)
 string(STRIP "${NETMON_VERSION}" NETMON_VERSION)
 add_compile_definitions(NETMON_VERSION="${NETMON_VERSION}")
 
+# ---------------------------------------------------------------------------
+# Boot splash — art/splash.png replaces picoOS's "picoOS M.m.e" boot screen
+# on Display Pack builds.  picoOS (src/CMakeLists.txt) converts it at build
+# time with picoOS/tools/mkimage.py into a const RGB332 array in flash
+# (76,800 B on the Display Pack 2, no SRAM) and regenerates it whenever the
+# PNG changes.  The build host needs Pillow (pip install pillow).
+#
+# A normal variable, set before add_subdirectory(), like the app sources.
+# Override with -DPICOOS_SPLASH_IMAGE=<path>, or -DPICOOS_SPLASH_IMAGE= for
+# the plain version splash.  No-display builds ignore it.
+# ---------------------------------------------------------------------------
+if(NOT DEFINED PICOOS_SPLASH_IMAGE)
+    set(PICOOS_SPLASH_IMAGE ${CMAKE_CURRENT_SOURCE_DIR}/art/splash.png)
+endif()
+
 add_subdirectory(picoOS/src)
 
 # ---------------------------------------------------------------------------

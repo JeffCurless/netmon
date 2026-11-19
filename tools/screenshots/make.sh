@@ -28,7 +28,7 @@ trap 'rm -rf "$WORK"' EXIT
 DRV="$ROOT/picoOS/src/drivers/display.c"
 # The driver's font table and drawing primitives, used as-is.
 sed -n '/^static const uint8_t font8x8/,/^};/p' "$DRV" > "$WORK/font.inc"
-sed -n '/^static void draw_pixel_impl/,/^int display_open/p' "$DRV" \
+sed -n '/^static void draw_pixel_impl/,/^static void splash_draw/p' "$DRV" \
     | sed '$d' > "$WORK/draw.inc"
 
 VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
@@ -36,7 +36,7 @@ gcc -std=gnu11 -O1 -w \
     -DPICOOS_DISPLAY_ENABLE -DPICOOS_DISPLAY_PACK2 \
     -DPICOOS_WIFI_ENABLE -DPICOOS_BT_ENABLE \
     -DNETMON_VERSION="\"$VERSION\"" \
-    -DPICOOS_VERSION_MAJOR=0 -DPICOOS_VERSION_MINOR=5 -DPICOOS_VERSION_EDIT=2 \
+    -DPICOOS_VERSION_MAJOR=0 -DPICOOS_VERSION_MINOR=5 -DPICOOS_VERSION_EDIT=3 \
     -I"$WORK" -I"$ROOT/apps" -I"$ROOT/picoOS/src" \
     "$ROOT/tools/screenshots/shots.c" "$ROOT/apps/oui.c" "$ROOT/apps/oui_data.c" \
     -o "$WORK/shots"
