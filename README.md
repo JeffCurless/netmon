@@ -112,7 +112,7 @@ One bar per 2.4 GHz channel (1–13) showing congestion over the last 8 scan win
   <img src="docs/images/beacons.png" width="320" alt="Beacons and tags">
 </p>
 
-**Scan** runs Classic inquiry and BLE active scanning together. A device is labelled by its name, else its beacon kind, else its vendor (from public addresses). Phones, watches and earbuds usually use random, rotating addresses and send no name, so they often show as `Unknown`. **Beacons** shows only iBeacon, AltBeacon, Eddystone, Apple Find My, Tile and Samsung SmartTag.
+**Scan** runs Classic inquiry and BLE active scanning together. A device is labelled by its name. Phones, watches and earbuds usually send none, so an unnamed device is labelled by what it advertises, followed by the last two bytes of its address to tell two of a kind apart. That is the first of: its beacon or tracker kind, Apple message type, GAP appearance, address vendor, manufacturer, service (for example `Google 98C1` for Google service data), or a manufacturer ID NetMon has no name for (`Co 4C42`). Examples: `AirPods 6A2C`, `Nearby 14B7`, `Microsof F203`. A device that advertises none of these, only its flags, shows as `Unknown` with its address bytes. The same labels are used on the detail, Finder, Pairs and Watch screens. **Beacons** shows only iBeacon, AltBeacon, Eddystone, Apple Find My, Tile and Samsung SmartTag.
 
 <p align="center">
   <img src="docs/images/bt-detail.png" width="320" alt="Classic device detail">
@@ -178,6 +178,8 @@ Each entry shows its state (`+` here, `-` gone, `?` not seen yet), its kind (`W`
 </p>
 
 NetMon and picoOS versions, kernel heap use, and how many WiFi / Bluetooth entries the survey log holds.
+
+**Full W / Full B** count the scan windows that came back full, out of all windows received since NetMon started. picoOS keeps at most 16 WiFi BSSIDs and 20 Bluetooth devices per window and drops the rest. If a large share of windows is full, NetMon is missing networks or devices: lists may flicker, and Pairs sees false arrivals and departures.
 
 ### Survey log
 
@@ -261,7 +263,7 @@ git submodule update --init
 ./clean          # remove all build directories
 ```
 
-Images land in `kits/` as `netmon-<board>-<VERSION>.uf2` (for example `kits/netmon-picow-0.2.2.uf2`). The version comes from the `VERSION` file; increment it there before a release. Build trees live in `builds/<board>_<display>/` (for example `builds/picow_D2/`).
+Images land in `kits/` as `netmon-<board>-<VERSION>.uf2` (for example `kits/netmon-picow-0.2.3.uf2`). The version comes from the `VERSION` file; increment it there before a release. Build trees live in `builds/<board>_<display>/` (for example `builds/picow_D2/`).
 
 Firmware is built for size (`-Os`, CMake `MinSizeRel`). For `-O3`, run `BUILD_TYPE=Release ./build`. NetMon's sources are compiled with picoOS's warning set, including `-Werror`, so a new warning fails the build.
 
@@ -331,7 +333,7 @@ You can also bind it to a Display Pack button with a `BUTTONA=netmon` (or B / X 
 
 ```
 netmon/
-├── VERSION              NetMon version (e.g. 0.2.2)
+├── VERSION              NetMon version (e.g. 0.2.3)
 ├── CMakeLists.txt       Root build: board aliases, -Os default, app injection, add_subdirectory(picoOS/src)
 ├── build / clean        Convenience build and clean scripts
 ├── apps/
@@ -377,7 +379,7 @@ Rules for picoOS apps:
 
 ## Memory budget
 
-Pico W with Display Pack 2 (NetMon 0.2.2, picoOS 0.5.2, `-Os`):
+Pico W with Display Pack 2 (NetMon 0.2.3, picoOS 0.5.2, `-Os`):
 
 | | Used | Free |
 |---|---|---|

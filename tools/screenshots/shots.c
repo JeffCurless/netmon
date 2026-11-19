@@ -440,10 +440,7 @@ int main(int argc, char **argv)
     /* Bluetooth, with a BT watch entry for the AirPods. */
     bt_devices();
     {
-        bt_scan_result_t a = s_dev[D_AIRPODS];
-        snprintf(a.name, sizeof a.name, "AirPods");
-        watch_toggle_bt(&a);
-        /* The watch entry keeps the label it was added with. */
+        watch_toggle_bt(&s_dev[D_AIRPODS]);   /* named by bt_label() */
     }
     for (uint32_t w = 1u; w <= BT_WINDOWS; w++) {
         bt_window(w);

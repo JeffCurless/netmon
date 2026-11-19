@@ -131,6 +131,14 @@ static bool              s_new_bt_data    = false;   /* s_bt_lock   */
 static volatile screen_t s_active_screen  = SCR_HOME; /* main writes, worker reads */
 static bool              s_scanning_wifi  = false;   /* s_wifi_lock */
 static bool              s_scanning_bt    = false;   /* s_bt_lock   */
+/* Scan windows received, and how many came back full (WIFI_ / BT_MAX_SCAN_
+ * RESULTS entries): picoOS drops whatever did not fit, so a high share of
+ * full windows means networks or devices are being missed.  Since netmon
+ * started; shown on About.                                                   */
+static uint32_t          s_wifi_windows   = 0u;      /* s_wifi_lock */
+static uint32_t          s_wifi_full      = 0u;      /* s_wifi_lock */
+static uint32_t          s_bt_windows     = 0u;      /* s_bt_lock   */
+static uint32_t          s_bt_full        = 0u;      /* s_bt_lock   */
 
 /* ---- WiFi result cache ---------------------------------------------------- */
 
@@ -623,15 +631,35 @@ static const char *bt_vendor(const bt_scan_result_t *dev)
     return oui_vendor(a[5], a[4], a[3]);
 }
 
-/* Best short label for a device: its name, else its beacon kind, else its
- * vendor. */
-static const char *bt_label(const bt_scan_result_t *dev)
+/* Short label for a device: its name, else what it is and the last two
+ * address bytes, so unnamed devices of one kind tell apart ("AirPods 6A2C").
+ * The kind is the first known of: beacon / tracker kind, Apple Continuity
+ * type, GAP appearance, OUI vendor, manufacturer, service (Service Data
+ * UUID, then the first service UUID), a manufacturer ID not in the table
+ * ("Co 4C42"); else "Unknown".  At most 13 characters without a name, to
+ * fit the BT list. */
+static void bt_label(const bt_scan_result_t *dev, char *buf, size_t len)
 {
-    if (dev->name[0]) return dev->name;
-    const char *t = bt_tag(dev);
-    if (t) return t;
-    t = bt_vendor(dev);
-    return t ? t : "Unknown";
+    if (dev->name[0]) { snprintf(buf, len, "%s", dev->name); return; }
+    const char *k = bt_tag(dev);
+    if (!k && dev->company_id == 0x004C && dev->mfr_data_len >= 1)
+        k = bt_apple_type_str(dev->mfr_data[0]);
+    if (!k && dev->appearance != BT_APPEARANCE_NONE)
+        k = bt_appearance_str(dev->appearance);
+    if (!k) k = bt_vendor(dev);
+    if (!k && dev->company_id != BT_COMPANY_NONE)
+        k = bt_company_name(dev->company_id);
+    if (!k && dev->svc_data_uuid != BT_SERVICE_NONE)
+        k = bt_service_name(dev->svc_data_uuid);
+    if (!k && dev->service_uuid != BT_SERVICE_NONE)
+        k = bt_service_name(dev->service_uuid);
+    char co[8];
+    if (!k && dev->company_id != BT_COMPANY_NONE) {
+        snprintf(co, sizeof co, "Co %04X", (unsigned)dev->company_id);
+        k = co;
+    }
+    if (!k) k = "Unknown";
+    snprintf(buf, len, "%.8s %02X%02X", k, dev->addr[1], dev->addr[0]);
 }
 
 /* Device type in a Microsoft CDP beacon (Windows "Swift Pair"/CDP). */
@@ -801,23 +829,6 @@ static bt_role_t bt_role(const bt_scan_result_t *dev)
 static const char *bt_role_str(bt_role_t r)
 {
     return r == ROLE_HUB ? "Phone/PC" : r == ROLE_ACC ? "Accessory" : "Other";
-}
-
-/* A label that tells two unnamed devices apart: name, else its kind and the
- * last two address bytes. */
-static void bt_pair_label(const bt_scan_result_t *dev, char *buf, size_t len)
-{
-    if (dev->name[0]) { snprintf(buf, len, "%s", dev->name); return; }
-    const char *k = bt_tag(dev);
-    if (!k && dev->company_id == 0x004C && dev->mfr_data_len >= 1)
-        k = bt_apple_type_str(dev->mfr_data[0]);
-    if (!k && dev->appearance != BT_APPEARANCE_NONE)
-        k = bt_appearance_str(dev->appearance);
-    if (!k) k = bt_vendor(dev);
-    if (!k && dev->company_id != BT_COMPANY_NONE)
-        k = bt_company_name(dev->company_id);
-    if (!k) k = "?";
-    snprintf(buf, len, "%.9s %02X%02X", k, dev->addr[1], dev->addr[0]);
 }
 
 static uint64_t isqrt64(uint64_t v)
@@ -1381,7 +1392,11 @@ static void watch_toggle_bt(const bt_scan_result_t *dev)
     kmutex_lock(&s_watch_lock);
     int i = watch_find_bt(dev->addr);
     if (i >= 0) watch_remove_locked(i);
-    else        watch_add_locked('B', bt_label(dev), dev->addr);
+    else {
+        char lab[BT_NAME_LEN];
+        bt_label(dev, lab, sizeof lab);
+        watch_add_locked('B', lab, dev->addr);
+    }
     kmutex_unlock(&s_watch_lock);
 }
 
@@ -1996,10 +2011,16 @@ static void render_bt(ui_state_t *st)
         int view = i - st->scroll;
         if (view < 0 || view >= (int)VISIBLE_ROWS) continue;
         const bt_scan_result_t *dev = &s_bt_cache[map[i]];
-        /* Beacons: the kind first; a beacon rarely has a name. */
-        const char *nm = st->bt_filter ? bt_tag(dev) : bt_label(dev);
+        /* Beacons: the kind first (a beacon rarely has a name), with the
+         * address bytes that tell two of a kind apart. */
+        char nm[BT_NAME_LEN];
+        if (st->bt_filter)
+            snprintf(nm, sizeof nm, "%.8s %02X%02X", bt_tag(dev),
+                     dev->addr[1], dev->addr[0]);
+        else
+            bt_label(dev, nm, sizeof nm);
         char line[20];
-        snprintf(line, sizeof(line), "%-11.11s %4d", nm, (int)dev->rssi);
+        snprintf(line, sizeof(line), "%-13.13s%4d", nm, (int)dev->rssi);
         draw_row(view, line, rssi_color(dev->rssi), i == st->sel);
     }
 }
@@ -2037,9 +2058,9 @@ static void render_bt_finder(ui_state_t *st)
     const bt_scan_result_t *dev = &s_bt_cache[idx];
     bool seen = s_bt_seen[idx];
 
-    char tmp[20];
-    snprintf(tmp, sizeof(tmp), "%s%.17s", watch_has_bt(dev->addr) ? "*" : "",
-             bt_label(dev));
+    char tmp[20], lab[BT_NAME_LEN];
+    bt_label(dev, lab, sizeof lab);
+    snprintf(tmp, sizeof(tmp), "%s%.17s", watch_has_bt(dev->addr) ? "*" : "", lab);
     draw_title(tmp);
     clear_content();
 
@@ -2133,8 +2154,8 @@ static void render_bt_pairs(ui_state_t *st)
         int view = i - st->scroll;
         if (view < 0 || view >= PAIR_ROWS) continue;
         const corr_pair_t *p = &s_pairs[i];
-        bt_pair_label(&s_bt_cache[p->a], la, sizeof(la));
-        bt_pair_label(&s_bt_cache[p->b], lb, sizeof(lb));
+        bt_label(&s_bt_cache[p->a], la, sizeof(la));
+        bt_label(&s_bt_cache[p->b], lb, sizeof(lb));
         /* '*' marks a phone/computer with an accessory. */
         snprintf(line, sizeof(line), "%3d%c%.14s", p->score, p->fit ? '*' : ' ', la);
         draw_row(view * 2, line, score_color(p->score), i == st->sel);
@@ -2208,11 +2229,11 @@ static void render_bt_pair(ui_state_t *st)
         }                                                                   \
         row++;                                                              \
     } while (0)
-    bt_pair_label(da, lab, sizeof(lab));
+    bt_label(da, lab, sizeof(lab));
     PROW(COLOR_YELLOW, "A %.17s", lab);
     PROW(COLOR_GREY,   "  %-9s %4d", bt_role_str(bt_role(da)),
          s_bt_seen[a] ? (int)da->rssi : 0);
-    bt_pair_label(db, lab, sizeof(lab));
+    bt_label(db, lab, sizeof(lab));
     PROW(COLOR_CYAN,   "B %.17s", lab);
     PROW(COLOR_GREY,   "  %-9s %4d", bt_role_str(bt_role(db)),
          s_bt_seen[b] ? (int)db->rssi : 0);
@@ -2245,8 +2266,9 @@ static void render_bt_detail(ui_state_t *st)
 
     const bt_scan_result_t *dev = &s_bt_cache[idx];
 
-    char title[20];
-    snprintf(title, sizeof(title), "%.18s", bt_label(dev));
+    char title[20], lab[BT_NAME_LEN];
+    bt_label(dev, lab, sizeof lab);
+    snprintf(title, sizeof(title), "%.18s", lab);
     draw_title(title);
     clear_content();
 
@@ -2619,7 +2641,7 @@ static void render_about(void)
     uint32_t used = 0u, free_bytes = 0u, largest = 0u;
     kmem_stats(&used, &free_bytes, &largest);
 
-    char lines[7][20];
+    char lines[9][20];
     snprintf(lines[0], sizeof(lines[0]), "NetMon: v" NETMON_VERSION);
     snprintf(lines[1], sizeof(lines[1]), "picoOS: v%d.%d.%d",
              PICOOS_VERSION_MAJOR, PICOOS_VERSION_MINOR, PICOOS_VERSION_EDIT);
@@ -2632,7 +2654,18 @@ static void render_about(void)
     snprintf(lines[6], sizeof(lines[6]), "Log: W%d B%d", s_wlog_n, s_blog_n);
     kmutex_unlock(&s_log_lock);
 
-    for (int i = 0; i < 7; i++) {
+    /* Windows that came back full: entries beyond the limit were dropped.
+     * About holds no lock, so each cache lock is taken on its own here. */
+    kmutex_lock(&s_wifi_lock);
+    snprintf(lines[7], sizeof(lines[7]), "Full W %lu/%lu",
+             (unsigned long)s_wifi_full, (unsigned long)s_wifi_windows);
+    kmutex_unlock(&s_wifi_lock);
+    kmutex_lock(&s_bt_lock);
+    snprintf(lines[8], sizeof(lines[8]), "Full B %lu/%lu",
+             (unsigned long)s_bt_full, (unsigned long)s_bt_windows);
+    kmutex_unlock(&s_bt_lock);
+
+    for (int i = 0; i < 9; i++) {
         int y = (int)TITLE_H + i * (int)ROW_H + ((int)ROW_H - 16) / 2;
         disp_text_arg_t t = {
             .x = TEXT_X, .y = (uint16_t)y,
@@ -3186,6 +3219,8 @@ static void merge_wifi_window(const wifi_scan_list_t *l)
     merge_into_cache(l->items, idx, aps, n, l->seq);
     ap_track(l->items, l->count, l->seq);
     survey_window(l->items, l->count);
+    s_wifi_windows++;
+    if (l->count >= WIFI_MAX_SCAN_RESULTS) s_wifi_full++;
     s_scanning_wifi = false;
     s_new_wifi_data = true;
     kmutex_unlock(&s_wifi_lock);
@@ -3198,6 +3233,8 @@ static void merge_bt_window(const bt_scan_list_t *l)
 {
     kmutex_lock(&s_bt_lock);
     merge_bt_into_cache(l->items, l->count, l->seq);
+    s_bt_windows++;
+    if (l->count >= BT_MAX_SCAN_RESULTS) s_bt_full++;
     s_scanning_bt = false;
     s_new_bt_data = true;
     s_bt_scan_end = true;
@@ -3275,6 +3312,8 @@ void netmon_entry(void *arg)
     s_watch_ev_count = 0;
     s_wlog_n = 0;
     s_blog_n = 0;
+    s_wifi_windows = s_wifi_full = 0u;   /* statics outlive a restarted app */
+    s_bt_windows   = s_bt_full   = 0u;
     s_log_dirty = false;
     watch_load();
 
