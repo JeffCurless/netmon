@@ -1,11 +1,12 @@
 /*
  * netmon.c — NetMon display UI application
  *
- * Screens: Home → WiFi (Scan | Channels) | Bluetooth (Scan | Beacons) |
+ * Screens: Home → WiFi (Scan | Channels) | Bluetooth (Scan | Beacons | Pairs) |
  *               Watch | About
  * Buttons: A=up  B=down  X=select  Y=back
- *   WiFi detail: A watch/unwatch, X per-SSID AP list
+ *   WiFi detail: A watch/unwatch, B scroll (wraps), X per-SSID AP list
  *   BT detail:   X finder (in the finder, X watch/unwatch)
+ *   Pairs:       X opens a pair (both devices, evidence, RSSI traces)
  *   Channels:    X bar chart <-> selected channel's history
  *   Watch:       X remove the selected entry
  */
@@ -72,11 +73,12 @@
 #define VISIBLE_ROWS  ((DISP_HEIGHT - TITLE_H) / ROW_H)
 #define DETAIL_ROWS   ((GRAPH_Y_TOP - TITLE_H) / DETAIL_ROW_H)  /* above graph */
 #define BT_DETAIL_MAX_LINES 28u
+#define WIFI_DETAIL_MAX_LINES 12u
 
 /* ---- state ---------------------------------------------------------------- */
 typedef enum { SCR_HOME = 0, SCR_WIFI, SCR_BT, SCR_BT_DETAIL, SCR_ABOUT, SCR_WIFI_DETAIL,
                SCR_CHANNELS, SCR_WIFI_APS, SCR_BT_FINDER, SCR_WATCH,
-               SCR_WIFI_MENU, SCR_BT_MENU } screen_t;
+               SCR_WIFI_MENU, SCR_BT_MENU, SCR_BT_PAIRS, SCR_BT_PAIR } screen_t;
 
 enum { MENU_HOME = 0, MENU_WIFI, MENU_BT, MENU_COUNT };
 
@@ -92,9 +94,12 @@ typedef struct {
     int      bt_scroll;
     int      bt_detail_idx; /* s_bt_cache index shown in the BT detail panel */
     uint8_t  bt_detail_addr[BT_ADDR_LEN]; /* its address, to spot a reused slot */
-    int      detail_scroll; /* first row shown on the BT detail panel */
+    int      detail_scroll; /* first row shown on a WiFi / BT detail panel */
     bool     chan_hist;     /* Channels: history graph instead of bars */
     bool     bt_filter;     /* BT list shows beacons and trackers only */
+    int      pair_sel;      /* Pairs list cursor saved when entering a pair */
+    int      pair_scroll;
+    uint8_t  pair_addr[2][BT_ADDR_LEN]; /* the pair open in the pair panel */
     bool     dirty;
 } ui_state_t;
 
@@ -197,6 +202,58 @@ static bool             s_bt_scan_end = false;
 static int8_t           s_bt_rssi_history[DISP_WIDTH];
 static int              s_bt_graph_head = 0;
 
+/* ---- co-presence history (Pairs screen) ----------------------------------- *
+ * One byte per cached device per window, over the last CORR_WINDOWS windows:
+ * 0 = absent, CORR_HELD = present (within its seen hold) but not heard this
+ * window, else the RSSI heard (always < 0).  Devices carried by one person
+ * (a phone and its watch or earbuds) arrive, leave and move together, so
+ * their presence and RSSI correlate over time.  A slot's row restarts when
+ * the slot is filled with another device.  Ring position = window number %
+ * CORR_WINDOWS.  Guarded by s_bt_lock.                                       */
+#define CORR_WINDOWS      128     /* ~2 min of 1 s windows                  */
+#define CORR_HELD         1
+#define CORR_MIN_WINDOWS  20      /* windows recorded before any scoring    */
+#define CORR_MIN_SAMPLES  12      /* windows both heard, for RSSI corr.     */
+#define CORR_MIN_SCORE    40      /* listed from this score (0..100)        */
+#define CORR_MAX_PAIRS    16
+#define CORR_NONE         (-1000) /* correlation undefined (no variation)   */
+
+static int8_t   s_corr[BT_MAX_SCAN_RESULTS][CORR_WINDOWS];
+static uint32_t s_corr_win = 0u;  /* latest window recorded                 */
+static int      s_corr_n   = 0;   /* windows recorded, up to CORR_WINDOWS   */
+
+static void corr_reset(void)
+{
+    memset(s_corr, 0, sizeof(s_corr));
+    s_corr_win = 0u;
+    s_corr_n   = 0;
+}
+
+/* Record window `win` for every slot, once s_bt_seen[] is up to date.
+ * Windows lost in between (a slow reader) are recorded as absent. */
+static void corr_record(uint32_t win)
+{
+    uint32_t gap = s_corr_n > 0 ? win - s_corr_win : 1u;
+    if (gap == 0u) return;
+    for (uint32_t k = 1u; k < gap && k <= CORR_WINDOWS; k++) {
+        int pos = (int)((s_corr_win + k) % CORR_WINDOWS);
+        for (int j = 0; j < BT_MAX_SCAN_RESULTS; j++) s_corr[j][pos] = 0;
+    }
+    int pos = (int)(win % CORR_WINDOWS);
+    for (int j = 0; j < BT_MAX_SCAN_RESULTS; j++) {
+        int8_t v = 0;
+        if (j < s_bt_count && s_bt_seen[j]) {
+            v = CORR_HELD;
+            if (s_bt_last_win[j] == win)
+                v = s_bt_cache[j].rssi < 0 ? s_bt_cache[j].rssi : (int8_t)-1;
+        }
+        s_corr[j][pos] = v;
+    }
+    s_corr_win = win;
+    uint32_t n = (uint32_t)s_corr_n + gap;
+    s_corr_n   = n > CORR_WINDOWS ? CORR_WINDOWS : (int)n;
+}
+
 /* Copy the fields a window reported into a cached entry; a field the window
  * did not carry keeps its cached value.  Returns the number changed. */
 #define MERGE_FIELD(f, none)                                  \
@@ -275,6 +332,7 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count,
             s_bt_cache[s_bt_count]     = raw[i];
             s_bt_last_win[s_bt_count]  = valid ? win : 0u;
             s_bt_first_win[s_bt_count] = win;
+            memset(s_corr[s_bt_count], 0, CORR_WINDOWS);
             s_bt_count++;           /* increment after full write */
             changes++;
         } else {
@@ -291,6 +349,7 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count,
                 s_bt_last_win[old]  = valid ? win : 0u;
                 s_bt_first_win[old] = win;
                 s_bt_seen[old]      = valid;
+                memset(s_corr[old], 0, CORR_WINDOWS);
                 changes++;
             }
         }
@@ -301,6 +360,7 @@ static int merge_bt_into_cache(const bt_scan_result_t *raw, int count,
         s_bt_seen[j] = s_bt_last_win[j] != 0u &&
                        win - s_bt_last_win[j] < hold;
     }
+    corr_record(win);
     s_bt_win = win;
     return changes;
 }
@@ -669,6 +729,188 @@ static int bt_distance_dm(int loss_1m)
     int dm = f[loss_1m % 20] / 100;            /* 1 m = 10 dm */
     for (int k = loss_1m / 20; k > 0; k--) dm *= 10;
     return dm;
+}
+
+/* ---- co-presence pairs ---------------------------------------------------- */
+
+/* What a device is likely to be in a pairing: a phone or computer (hub), or
+ * something that connects to one (accessory: watch, earbuds, HID ...). */
+typedef enum { ROLE_OTHER = 0, ROLE_HUB, ROLE_ACC } bt_role_t;
+
+static bt_role_t bt_role(const bt_scan_result_t *dev)
+{
+    static const char *const acc_names[] = {
+        "AirPods", "Buds", "Watch", "Pods", "Band", "Beats", "Headphone",
+        "Headset", "Earbud", "WH-", "WF-", "Keyboard", "Mouse" };
+    static const char *const hub_names[] = {
+        "iPhone", "iPad", "MacBook", "iMac", "Pixel", "Galaxy", "Phone",
+        "Laptop" };
+    if (bt_tag(dev)) return ROLE_OTHER;     /* beacons and trackers */
+    /* Accessory names first: "Galaxy Buds" is not a phone. */
+    if (dev->name[0]) {
+        for (int i = 0; i < (int)(sizeof acc_names / sizeof acc_names[0]); i++)
+            if (strstr(dev->name, acc_names[i])) return ROLE_ACC;
+        for (int i = 0; i < (int)(sizeof hub_names / sizeof hub_names[0]); i++)
+            if (strstr(dev->name, hub_names[i])) return ROLE_HUB;
+    }
+    if (dev->class_of_device) {
+        switch ((dev->class_of_device >> 8) & 0x1Fu) {
+        case 1: case 2:         return ROLE_HUB;   /* computer, phone      */
+        case 4: case 5: case 7:
+        case 9:                 return ROLE_ACC;   /* audio, HID, wearable,
+                                                    * health              */
+        }
+    }
+    if (dev->appearance != BT_APPEARANCE_NONE) {
+        switch (dev->appearance >> 6) {
+        case 1: case 2:         return ROLE_HUB;
+        case 3: case 13: case 15: case 17: case 18: case 33: case 37:
+        case 41:                return ROLE_ACC;
+        }
+    }
+    if (dev->company_id == 0x004C && dev->mfr_data_len >= 1) {
+        if (dev->mfr_data[0] == 0x07 || dev->mfr_data[0] == 0x0B)
+            return ROLE_ACC;                       /* AirPods, Watch       */
+    }
+    if (dev->company_id == 0x0006 && dev->mfr_data_len >= 2 &&
+        dev->mfr_data[0] == 0x01) {                /* Microsoft CDP        */
+        switch (dev->mfr_data[1] & 0x1Fu) {
+        case 6: case 7: case 8: case 9: case 11: case 15: case 16:
+            return ROLE_HUB;
+        }
+    }
+    if (bt_has_uuid(dev, 0xFE2C)) return ROLE_ACC; /* Fast Pair accessory  */
+    return ROLE_OTHER;
+}
+
+static const char *bt_role_str(bt_role_t r)
+{
+    return r == ROLE_HUB ? "Phone/PC" : r == ROLE_ACC ? "Accessory" : "Other";
+}
+
+/* A label that tells two unnamed devices apart: name, else its kind and the
+ * last two address bytes. */
+static void bt_pair_label(const bt_scan_result_t *dev, char *buf, size_t len)
+{
+    if (dev->name[0]) { snprintf(buf, len, "%s", dev->name); return; }
+    const char *k = bt_tag(dev);
+    if (!k && dev->company_id == 0x004C && dev->mfr_data_len >= 1)
+        k = bt_apple_type_str(dev->mfr_data[0]);
+    if (!k && dev->appearance != BT_APPEARANCE_NONE)
+        k = bt_appearance_str(dev->appearance);
+    if (!k) k = bt_vendor(dev);
+    if (!k && dev->company_id != BT_COMPANY_NONE)
+        k = bt_company_name(dev->company_id);
+    if (!k) k = "?";
+    snprintf(buf, len, "%.9s %02X%02X", k, dev->addr[1], dev->addr[0]);
+}
+
+static uint64_t isqrt64(uint64_t v)
+{
+    uint64_t r = 0u, bit = 1ull << 62;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; }
+        else              { r >>= 1; }
+        bit >>= 2;
+    }
+    return r;
+}
+
+/* Pearson correlation x 100 from running sums, or CORR_NONE when either
+ * series varies less than `min_var` (n^2 x variance). */
+static int pearson100(int64_t n, int64_t sx, int64_t sy, int64_t sxx,
+                      int64_t syy, int64_t sxy, int64_t min_var)
+{
+    int64_t vx = n * sxx - sx * sx;
+    int64_t vy = n * syy - sy * sy;
+    if (vx < min_var || vy < min_var) return CORR_NONE;
+    uint64_t d = isqrt64((uint64_t)vx * (uint64_t)vy);
+    if (d == 0u) return CORR_NONE;
+    return (int)((n * sxy - sx * sy) * 100 / (int64_t)d);
+}
+
+typedef struct {
+    uint8_t a, b;      /* s_bt_cache slots                                  */
+    int16_t score;     /* 0..100: the stronger of pres and rssi             */
+    int16_t pres;      /* presence correlation x 100, or CORR_NONE          */
+    int16_t rssi;      /* RSSI correlation x 100, or CORR_NONE              */
+    int16_t together;  /* % of windows either was present that both were    */
+    int16_t samples;   /* windows both were heard (RSSI pairs)              */
+    bool    fit;       /* one phone/computer and one accessory              */
+} corr_pair_t;
+
+/* Score slots a and b over the recorded windows.  False if they were never
+ * present together.  Caller holds s_bt_lock. */
+static bool corr_pair(int a, int b, corr_pair_t *out)
+{
+    int n = s_corr_n, pa = 0, pb = 0, pab = 0, m = 0;
+    int64_t sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (int k = 0; k < n; k++) {
+        int pos = (int)((s_corr_win - (uint32_t)k) % CORR_WINDOWS);
+        int x = s_corr[a][pos], y = s_corr[b][pos];
+        pa  += x != 0;
+        pb  += y != 0;
+        pab += x != 0 && y != 0;
+        if (x < 0 && y < 0) {
+            m++;
+            sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y;
+        }
+    }
+    if (pab == 0) return false;
+    out->a        = (uint8_t)a;
+    out->b        = (uint8_t)b;
+    /* Presence as 0/1 series: sum of squares equals the sum. */
+    out->pres     = (int16_t)pearson100(n, pa, pb, pa, pb, pab, 1);
+    out->rssi     = m >= CORR_MIN_SAMPLES
+                  ? (int16_t)pearson100(m, sx, sy, sxx, syy, sxy, (int64_t)m * m)
+                  : (int16_t)CORR_NONE;   /* min_var: a 1 dB spread at least */
+    out->together = (int16_t)(pab * 100 / (pa + pb - pab));
+    out->samples  = (int16_t)m;
+    int s = out->pres > out->rssi ? out->pres : out->rssi;
+    out->score    = (int16_t)(s < 0 ? 0 : s);
+    bt_role_t ra = bt_role(&s_bt_cache[a]), rb = bt_role(&s_bt_cache[b]);
+    out->fit      = (ra == ROLE_HUB && rb == ROLE_ACC) ||
+                    (ra == ROLE_ACC && rb == ROLE_HUB);
+    return true;
+}
+
+/* The Pairs list, best first, rebuilt every window.  Main thread only; its
+ * slots are valid while s_bt_lock is held, until the next merge. */
+static corr_pair_t s_pairs[CORR_MAX_PAIRS];
+static int         s_pair_count = 0;
+
+static void corr_build(void)
+{
+    s_pair_count = 0;
+    if (s_corr_n < CORR_MIN_WINDOWS) return;
+    for (int a = 0; a < s_bt_count; a++) {
+        for (int b = a + 1; b < s_bt_count; b++) {
+            corr_pair_t p;
+            if (!corr_pair(a, b, &p) || p.score < CORR_MIN_SCORE) continue;
+            /* Insertion into the sorted top list; a phone-accessory pair
+             * wins a tie. */
+            int at = s_pair_count;
+            while (at > 0 && (s_pairs[at - 1].score < p.score ||
+                              (s_pairs[at - 1].score == p.score &&
+                               p.fit && !s_pairs[at - 1].fit)))
+                at--;
+            if (at >= CORR_MAX_PAIRS) continue;
+            int last = s_pair_count < CORR_MAX_PAIRS ? s_pair_count
+                                                     : CORR_MAX_PAIRS - 1;
+            for (int k = last; k > at; k--) s_pairs[k] = s_pairs[k - 1];
+            s_pairs[at] = p;
+            if (s_pair_count < CORR_MAX_PAIRS) s_pair_count++;
+        }
+    }
+}
+
+/* Cache slot holding `addr`, or -1.  Caller holds s_bt_lock. */
+static int bt_find(const uint8_t *addr)
+{
+    for (int i = 0; i < s_bt_count; i++)
+        if (memcmp(s_bt_cache[i].addr, addr, BT_ADDR_LEN) == 0) return i;
+    return -1;
 }
 
 /* ---- WiFi helpers --------------------------------------------------------- */
@@ -1572,6 +1814,7 @@ static const menu_item_t s_wifi_items[] = {
 static const menu_item_t s_bt_items[] = {
     { "Scan",      SCR_BT,        false },
     { "Beacons",   SCR_BT,        true  },
+    { "Pairs",     SCR_BT_PAIRS,  false },
 };
 #define ITEMS(a) (a), (int)(sizeof(a) / sizeof((a)[0]))
 static const menu_t s_menus[MENU_COUNT] = {
@@ -1597,7 +1840,7 @@ static screen_t screen_parent(screen_t s)
 {
     switch (s) {
     case SCR_WIFI: case SCR_CHANNELS: return SCR_WIFI_MENU;
-    case SCR_BT:                      return SCR_BT_MENU;
+    case SCR_BT: case SCR_BT_PAIRS:   return SCR_BT_MENU;
     default:                          return SCR_HOME;
     }
 }
@@ -1835,6 +2078,146 @@ static void render_bt_finder(ui_state_t *st)
 #endif
 }
 
+/* Pairs list: two rows per pair, score and first device, then the second. */
+#define PAIR_ROWS  ((int)VISIBLE_ROWS / 2)
+
+static void adjust_pair_scroll(ui_state_t *st)
+{
+    if (st->sel < st->scroll) st->scroll = st->sel;
+    if (st->sel >= st->scroll + PAIR_ROWS) st->scroll = st->sel - PAIR_ROWS + 1;
+    if (st->scroll > s_pair_count - PAIR_ROWS) st->scroll = s_pair_count - PAIR_ROWS;
+    if (st->scroll < 0) st->scroll = 0;
+}
+
+static uint8_t score_color(int score)
+{
+    return score >= 70 ? COLOR_GREEN : score >= 55 ? COLOR_YELLOW : COLOR_GREY;
+}
+
+static void render_bt_pairs(ui_state_t *st)
+{
+    draw_title("Pairs");
+    clear_content();
+
+    char line[24], la[20], lb[20];
+    if (s_corr_n < CORR_MIN_WINDOWS) {
+        snprintf(line, sizeof(line), "Learning %d/%ds", s_corr_n, CORR_MIN_WINDOWS);
+        draw_message(line);
+        draw_row(1, "Keep NetMon still", COLOR_GREY, false);
+        return;
+    }
+    if (s_pair_count == 0) {
+        draw_message("No pairs yet");
+        draw_row(1, "Movement helps:", COLOR_GREY, false);
+        draw_row(2, "devices that come", COLOR_GREY, false);
+        draw_row(3, "& go together", COLOR_GREY, false);
+        return;
+    }
+
+    for (int i = 0; i < s_pair_count; i++) {
+        int view = i - st->scroll;
+        if (view < 0 || view >= PAIR_ROWS) continue;
+        const corr_pair_t *p = &s_pairs[i];
+        bt_pair_label(&s_bt_cache[p->a], la, sizeof(la));
+        bt_pair_label(&s_bt_cache[p->b], lb, sizeof(lb));
+        /* '*' marks a phone/computer with an accessory. */
+        snprintf(line, sizeof(line), "%3d%c%.14s", p->score, p->fit ? '*' : ' ', la);
+        draw_row(view * 2, line, score_color(p->score), i == st->sel);
+        snprintf(line, sizeof(line), "   +%.14s", lb);
+        draw_row(view * 2 + 1, line, COLOR_GREY, false);
+    }
+}
+
+
+/* One device's RSSI over the recorded windows, oldest at the left. */
+static void draw_corr_trace(int slot, uint8_t color)
+{
+    int cw = (int)DISP_WIDTH / CORR_WINDOWS;
+    if (cw < 1) cw = 1;
+    int x0 = (int)DISP_WIDTH - cw * CORR_WINDOWS;
+    if (x0 < 0) x0 = 0;
+    for (int k = 0; k < s_corr_n; k++) {
+        int pos = (int)((s_corr_win - (uint32_t)(s_corr_n - 1 - k)) % CORR_WINDOWS);
+        int v = s_corr[slot][pos];
+        int col = CORR_WINDOWS - s_corr_n + k;
+        int x = x0 + col * cw;
+        if (x + cw > (int)DISP_WIDTH) break;
+        int y, h = 2;
+        if (v < 0) {
+            int str = (v + 100) * ((int)GRAPH_H - 2) / 70;
+            if (str < 0)                  str = 0;
+            if (str > (int)GRAPH_H - 2)   str = (int)GRAPH_H - 2;
+            y = (int)GRAPH_Y_BOT - 1 - str;
+        } else if (v == CORR_HELD) {
+            y = (int)GRAPH_Y_BOT; h = 1;  /* present, not heard: baseline */
+        } else {
+            continue;                     /* absent */
+        }
+        disp_rect_arg_t r = {
+            .x = (uint16_t)x, .y = (uint16_t)y, .w = (uint16_t)cw, .h = (uint16_t)h,
+            .color = color, .filled = 1, ._pad1 = 0, ._pad2 = 0
+        };
+        dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &r);
+    }
+}
+
+static void fmt_corr(char *buf, size_t len, int v)
+{
+    if (v == CORR_NONE) snprintf(buf, len, "--");
+    else                fmt_fixed(buf, len, v, 100);
+}
+
+/* One pair: both devices, the evidence, and both RSSI traces overlaid. */
+static void render_bt_pair(ui_state_t *st)
+{
+    int a = bt_find(st->pair_addr[0]), b = bt_find(st->pair_addr[1]);
+    corr_pair_t p;
+    if (a < 0 || b < 0 || !corr_pair(a, b, &p)) {
+        draw_title("Pair");
+        clear_content();
+        draw_message("No data");
+        return;
+    }
+    char line[24], lab[20], v[12];
+    snprintf(line, sizeof(line), "Pair %d%s", p.score, p.fit ? " *" : "");
+    draw_title(line);
+    clear_content();
+
+    const bt_scan_result_t *da = &s_bt_cache[a], *db = &s_bt_cache[b];
+    int row = 0;
+#define PROW(color, ...)                                                    \
+    do {                                                                    \
+        if (row < (int)DETAIL_ROWS) {                                       \
+            snprintf(line, sizeof(line), __VA_ARGS__);                      \
+            draw_detail_row(row, line, (color));                            \
+        }                                                                   \
+        row++;                                                              \
+    } while (0)
+    bt_pair_label(da, lab, sizeof(lab));
+    PROW(COLOR_YELLOW, "A %.17s", lab);
+    PROW(COLOR_GREY,   "  %-9s %4d", bt_role_str(bt_role(da)),
+         s_bt_seen[a] ? (int)da->rssi : 0);
+    bt_pair_label(db, lab, sizeof(lab));
+    PROW(COLOR_CYAN,   "B %.17s", lab);
+    PROW(COLOR_GREY,   "  %-9s %4d", bt_role_str(bt_role(db)),
+         s_bt_seen[b] ? (int)db->rssi : 0);
+    PROW(COLOR_GREY,   "Together  %3d%%", p.together);
+    fmt_corr(v, sizeof v, p.pres);
+    PROW(score_color(p.pres), "Presence  %s", v);
+    fmt_corr(v, sizeof v, p.rssi);
+    PROW(score_color(p.rssi), "Signal    %s (%d)", v, p.samples);
+    PROW(COLOR_GREY,   "Over %ds", s_corr_n);
+#undef PROW
+
+    disp_rect_arg_t bg = {
+        .x = 0, .y = GRAPH_Y_TOP, .w = DISP_WIDTH, .h = GRAPH_H,
+        .color = COLOR_PANEL, .filled = 1, ._pad1 = 0, ._pad2 = 0
+    };
+    dev_ioctl(DEV_DISPLAY, IOCTL_DISP_DRAW_RECT, &bg);
+    draw_corr_trace(a, COLOR_YELLOW);
+    draw_corr_trace(b, COLOR_CYAN);
+}
+
 static void render_bt_detail(ui_state_t *st)
 {
     int idx = st->bt_detail_idx;
@@ -2044,20 +2427,33 @@ static void render_wifi_detail(ui_state_t *st)
     draw_title(title);
     clear_content();
 
-    /* Rows are emitted in order; ones with no data are skipped. */
-    int  row = 0;
+    /* Build every row that has data, then draw the part scrolled into
+     * view: with all optional rows present there are more than fit above
+     * the RSSI graph (DETAIL_ROWS).  Static for the same reason as in
+     * render_bt_detail(): the app stack is small, only the UI thread
+     * renders. */
+    static char    lines[WIFI_DETAIL_MAX_LINES][20];
+    static uint8_t colors[WIFI_DETAIL_MAX_LINES];
+    int  n = 0;
     char tmp[24];
+#define WROW(color)                                                         \
+    do {                                                                    \
+        if (n < (int)WIFI_DETAIL_MAX_LINES) {                               \
+            snprintf(lines[n], sizeof(lines[n]), "%s", tmp);                \
+            colors[n++] = (color);                                          \
+        }                                                                   \
+    } while (0)
 
     snprintf(tmp, sizeof(tmp), "RSSI: %ddBm", (int)net->rssi);
-    draw_detail_row(row++, tmp, rssi_color(net->rssi));
+    WROW(rssi_color(net->rssi));
 
     if (rssi_range(s_rssi_history, tmp, sizeof(tmp)))
-        draw_detail_row(row++, tmp, COLOR_GREY);
+        WROW(COLOR_GREY);
 
     if (net->noise != 0 || net->snr != 0) {
         snprintf(tmp, sizeof(tmp), "Noise:%d SNR:%ddB",
                  (int)net->noise, (int)net->snr);
-        draw_detail_row(row++, tmp, COLOR_GREY);
+        WROW(COLOR_GREY);
     }
 
     /* Channel: frequency when there is one, else the list of channels the
@@ -2074,30 +2470,30 @@ static void render_wifi_detail(ui_state_t *st)
                             i == 0 ? "%d" : ",%d", (int)s_wifi_chans[idx][i]);
         }
     }
-    draw_detail_row(row++, tmp, COLOR_GREY);
+    WROW(COLOR_GREY);
 
     if (net->max_rate != 0) {
         const char *std = (net->phy & WIFI_PHY_HT)   ? "11n" :
                           (net->phy & WIFI_PHY_OFDM) ? "11g" : "11b";
         snprintf(tmp, sizeof(tmp), "Mode: %s %s", std,
                  (net->phy & WIFI_PHY_HT40) ? "40MHz" : "20MHz");
-        draw_detail_row(row++, tmp, COLOR_GREY);
+        WROW(COLOR_GREY);
     }
 
     if (net->beacon_tu != 0) {
         /* 1 TU = 1.024 ms; rates are in 500 kb/s units. */
         snprintf(tmp, sizeof(tmp), "Bcn:%dms Max:%dM",
                  (int)net->beacon_tu * 1024 / 1000, (int)net->max_rate / 2);
-        draw_detail_row(row++, tmp, COLOR_GREY);
+        WROW(COLOR_GREY);
     }
 
     snprintf(tmp, sizeof(tmp), "Sec: %s", auth_label(net->auth_mode));
-    draw_detail_row(row++, tmp, auth_color(net->auth_mode));
+    WROW(auth_color(net->auth_mode));
 
     const char *vnd = mac_vendor(net->bssid[0], net->bssid[1], net->bssid[2]);
     if (vnd) {
         snprintf(tmp, sizeof(tmp), "Vnd: %s", vnd);
-        draw_detail_row(row++, tmp, COLOR_GREY);
+        WROW(COLOR_GREY);
     }
 
     /* Channel congestion: other networks heard this scan on the same
@@ -2111,13 +2507,23 @@ static void render_wifi_detail(ui_state_t *st)
     }
     snprintf(tmp, sizeof(tmp), "APs:%d CoCh:%d Adj:%d",
              s_wifi_aps[idx], coch, adj);
-    draw_detail_row(row++, tmp, COLOR_GREY);
+    WROW(COLOR_GREY);
 
     /* BSSID of the strongest AP for this SSID */
     const uint8_t *b = net->bssid;
     snprintf(tmp, sizeof(tmp), "%02X:%02X:%02X:%02X:%02X:%02X",
              b[0], b[1], b[2], b[3], b[4], b[5]);
-    draw_detail_row(row, tmp, COLOR_GREY);
+    WROW(COLOR_GREY);
+#undef WROW
+
+    /* B scrolls a row at a time and wraps back to the top. */
+    int max_scroll = n > (int)DETAIL_ROWS ? n - (int)DETAIL_ROWS : 0;
+    if (st->detail_scroll > max_scroll) st->detail_scroll = 0;
+    if (st->detail_scroll < 0)          st->detail_scroll = 0;
+    for (int r = 0; r < (int)DETAIL_ROWS && st->detail_scroll + r < n; r++)
+        draw_detail_row(r, lines[st->detail_scroll + r],
+                        colors[st->detail_scroll + r]);
+    draw_scroll_marks(st->detail_scroll > 0, st->detail_scroll < max_scroll);
 
     render_rssi_graph(s_rssi_history, s_graph_head);
 }
@@ -2369,6 +2775,8 @@ static void render_screen(ui_state_t *st)
     case SCR_WIFI_APS:    render_wifi_aps(st);    break;
     case SCR_BT_FINDER:   render_bt_finder(st);   break;
     case SCR_WATCH:       render_watch(st);       break;
+    case SCR_BT_PAIRS:    render_bt_pairs(st);    break;
+    case SCR_BT_PAIR:     render_bt_pair(st);     break;
     }
     dev_ioctl(DEV_DISPLAY, IOCTL_DISP_FLUSH, NULL);
 }
@@ -2386,6 +2794,7 @@ static kmutex_t *screen_lock(screen_t s)
     case SCR_WIFI: case SCR_WIFI_DETAIL: case SCR_CHANNELS: case SCR_WIFI_APS:
         return &s_wifi_lock;
     case SCR_BT:   case SCR_BT_DETAIL:   case SCR_BT_FINDER:
+    case SCR_BT_PAIRS: case SCR_BT_PAIR:
         return &s_bt_lock;
     case SCR_WATCH:
         return &s_watch_lock;
@@ -2419,13 +2828,15 @@ static void enter_screen(ui_state_t *st, screen_t s)
         kmutex_unlock(&s_wifi_lock);
         st->chan_hist = false;
         chan_hist_reset();
-    } else if (s == SCR_BT) {
+    } else if (s == SCR_BT || s == SCR_BT_PAIRS) {
         kmutex_lock(&s_bt_lock);
         s_bt_count    = 0;
         s_bt_scan_end = false;
         memset(s_bt_seen, 0, sizeof(s_bt_seen));
         memset(s_bt_last_win, 0, sizeof(s_bt_last_win));
+        corr_reset();
         kmutex_unlock(&s_bt_lock);
+        s_pair_count = 0;
     }
     s_active_screen = s;
 }
@@ -2497,6 +2908,7 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
                 st->wifi_sel    = st->sel;
                 st->wifi_scroll = st->scroll;
                 st->detail_idx  = st->sel;
+                st->detail_scroll = 0;
                 st->screen      = SCR_WIFI_DETAIL;
                 st->dirty       = true;
                 memset(s_rssi_history, 0, sizeof(s_rssi_history));
@@ -2517,6 +2929,8 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
             watch_toggle_wifi(&s_wifi_cache[st->detail_idx]);
             st->dirty = true;
         }
+        /* render_wifi_detail() wraps the scroll back to the top. */
+        if (pressed & DISP_BTN_B) { st->detail_scroll++; st->dirty = true; }
         if (pressed & DISP_BTN_X) {
             st->screen = SCR_WIFI_APS;
             st->sel    = 0;
@@ -2600,6 +3014,33 @@ static void handle_input(ui_state_t *st, uint8_t pressed)
         }
         if (pressed & DISP_BTN_Y) { st->screen = SCR_BT_DETAIL; st->dirty = true; }
         break;
+    case SCR_BT_PAIRS:
+        if ((pressed & DISP_BTN_A) && st->sel > 0) {
+            st->sel--; st->dirty = true;
+        }
+        if ((pressed & DISP_BTN_B) && st->sel < s_pair_count - 1) {
+            st->sel++; st->dirty = true;
+        }
+        adjust_pair_scroll(st);
+        if ((pressed & DISP_BTN_X) && st->sel < s_pair_count) {
+            const corr_pair_t *p = &s_pairs[st->sel];
+            memcpy(st->pair_addr[0], s_bt_cache[p->a].addr, BT_ADDR_LEN);
+            memcpy(st->pair_addr[1], s_bt_cache[p->b].addr, BT_ADDR_LEN);
+            st->pair_sel    = st->sel;
+            st->pair_scroll = st->scroll;
+            st->screen      = SCR_BT_PAIR;
+            st->dirty       = true;
+        }
+        if (pressed & DISP_BTN_Y) leave_screen(st);
+        break;
+    case SCR_BT_PAIR:
+        if (pressed & DISP_BTN_Y) {
+            st->screen = SCR_BT_PAIRS;
+            st->sel    = st->pair_sel;
+            st->scroll = st->pair_scroll;
+            st->dirty  = true;
+        }
+        break;
     case SCR_CHANNELS:
         if ((pressed & DISP_BTN_A) && st->sel > 0) {
             st->sel--; st->dirty = true;
@@ -2661,6 +3102,7 @@ static radio_t screen_radio(screen_t s)
     case SCR_WIFI: case SCR_WIFI_DETAIL: case SCR_CHANNELS: case SCR_WIFI_APS:
         return RADIO_WIFI;
     case SCR_BT:   case SCR_BT_DETAIL:   case SCR_BT_FINDER:
+    case SCR_BT_PAIRS: case SCR_BT_PAIR:
         return RADIO_BT;
     case SCR_WATCH:
         return RADIO_WATCH;
@@ -2926,6 +3368,27 @@ void netmon_entry(void *arg)
                 s_bt_graph_head = (s_bt_graph_head + 1) % (int)DISP_WIDTH;
             }
             s_bt_scan_end = false;
+            st.dirty = true;
+        }
+
+        if (s_new_bt_data &&
+            (st.screen == SCR_BT_PAIRS || st.screen == SCR_BT_PAIR)) {
+            s_new_bt_data = false;
+            s_bt_scan_end = false;
+            corr_build();
+            /* Either device of the open pair left the cache: back to the
+             * list rather than show a pair that no longer exists. */
+            if (st.screen == SCR_BT_PAIR &&
+                (bt_find(st.pair_addr[0]) < 0 || bt_find(st.pair_addr[1]) < 0)) {
+                st.screen = SCR_BT_PAIRS;
+                st.sel    = st.pair_sel;
+                st.scroll = st.pair_scroll;
+            }
+            if (st.screen == SCR_BT_PAIRS) {
+                if (st.sel >= s_pair_count)
+                    st.sel = s_pair_count > 0 ? s_pair_count - 1 : 0;
+                adjust_pair_scroll(&st);
+            }
             st.dirty = true;
         }
 

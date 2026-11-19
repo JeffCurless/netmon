@@ -11,6 +11,17 @@ elseif(PICO_BOARD STREQUAL "pico2w")
     set(PICO_BOARD "pico2_w" CACHE STRING "" FORCE)
 endif()
 
+# ---------------------------------------------------------------------------
+# Optimise for size by default (-Os) — mirrors picoOS/CMakeLists.txt, which is
+# bypassed here.  Without it the SDK picks Release (-O3), which inlines and
+# unrolls loops for much more flash.  Must come before the SDK import, which
+# applies its own default.  Override with -DCMAKE_BUILD_TYPE=Release.
+# ---------------------------------------------------------------------------
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE MinSizeRel CACHE STRING
+        "Choose the type of build, options are: 'Debug', 'Release', 'MinSizeRel', 'RelWithDebInfo'.")
+endif()
+
 include(pico_sdk_import.cmake)
 
 project(myproject C CXX ASM)
