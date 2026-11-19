@@ -1,4 +1,18 @@
 /*
+ * MIT License with Commons Clause
+ *
+ * Copyright (c) 2026 Jeff Curless
+ *
+ * Required Notice: Copyright (c) 2026 Jeff Curless.
+ *
+ * This software is licensed under the MIT License, subject to the Commons Clause
+ * License Condition v1.0. You may use, copy, modify, and distribute this software,
+ * but you may not sell the software itself, offer it as a paid service, or use it
+ * in a product or service whose value derives substantially from the software
+ * without prior written permission from the copyright holder.
+ */
+
+/*
  * shots.c — render NetMon screens on the host, for the README.
  *
  * Compiles the real apps/netmon.c (included below, so its statics are in

@@ -422,4 +422,4 @@ tools/screenshots/make.sh
 
 ## License
 
-NetMon is released under the MIT License; see [LICENSE](LICENSE). picoOS, included as a submodule, has its own terms (MIT with Commons Clause); see [picoOS/README.md](picoOS/README.md).
+NetMon is licensed under the same terms as picoOS: the MIT License with the Commons Clause (see [LICENSE](LICENSE)). It is source-available for educational and non-commercial use. You may study it, modify it and share improvements, but you may not sell it, offer it as a paid service, or remove the copyright notice without prior written permission from the copyright holder.
