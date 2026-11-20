@@ -32,6 +32,10 @@ NetMon only listens to what networks and devices broadcast. It never connects to
 
 ---
 
+## STL files for the case
+
+All of the STL files for the case are in the STL sub-directory.  Note that there is a .3mf file for the case top.  The case top consistes of the main top, an up-arrow, a down-arrow an LED Defuser, and a small design.  These are printed in diffent colors from the main body.  The 3mf file works on a PRUSA MK4S though I suspect it will work on many, many others.  All your should have to do is select the colors, on per "extruder".  Since my printer only has a single extruder, I added in a color change to the gcode for the "tool change" this makes the color changes work.
+
 ## Using NetMon
 
 ### Buttons
@@ -432,3 +436,4 @@ tools/screenshots/make.sh
 ## License
 
 NetMon is licensed under the same terms as picoOS: the MIT License with the Commons Clause (see [LICENSE](LICENSE)). It is source-available for educational and non-commercial use. You may study it, modify it and share improvements, but you may not sell it, offer it as a paid service, or remove the copyright notice without prior written permission from the copyright holder.
+  
